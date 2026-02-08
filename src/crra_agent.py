@@ -57,10 +57,13 @@ class CRRAAgent:
 
         return x_star
 
-    def update_portfolio(self, trade_shares, trade_price):
+    def update_portfolio(self, trade_shares, trade_cost):
         """
         Updates cash and shares after a trade is executed.
+
+        Args:
+            trade_shares (float): Number of shares bought (+) or sold (-).
+            trade_cost (float): Total cost of the trade from the market maker.
         """
-        cost = trade_shares * trade_price
-        self.cash -= cost
+        self.cash -= trade_cost
         self.shares += trade_shares
