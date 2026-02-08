@@ -67,10 +67,28 @@ def run_phase1(
         trade_volume.append(round_volume)
 
     mean_initial_belief = float(np.mean(beliefs))
+    final_price = float(price_series[-1]) if price_series else float(market.get_price())
+    error_series = [abs(q - ground_truth) for q in price_series]
+    final_error = float(error_series[-1]) if error_series else abs(final_price - ground_truth)
 
     final_positions = [agent.shares for agent in agents]
     final_cash = [agent.cash for agent in agents]
     final_rhos = [agent.rho for agent in agents]
+
+    # simple grouping by rho for analysis
+    rho_groups = {}
+    for rho, shares, cash in zip(final_rhos, final_positions, final_cash):
+        if rho not in rho_groups:
+            rho_groups[rho] = {"shares": [], "cash": []}
+        rho_groups[rho]["shares"].append(shares)
+        rho_groups[rho]["cash"].append(cash)
+
+    rho_summary = {}
+    for rho, data in rho_groups.items():
+        rho_summary[rho] = {
+            "avg_shares": float(np.mean(data["shares"])) if data["shares"] else 0.0,
+            "avg_cash": float(np.mean(data["cash"])) if data["cash"] else 0.0,
+        }
 
     return {
         "seed": seed,
@@ -79,9 +97,13 @@ def run_phase1(
         "n_rounds": n_rounds,
         "b": b,
         "mean_initial_belief": mean_initial_belief,
+        "final_price": final_price,
+        "final_error": final_error,
         "price_series": price_series,
+        "error_series": error_series,
         "trade_volume": trade_volume,
         "final_positions": final_positions,
         "final_cash": final_cash,
         "final_rhos": final_rhos,
+        "rho_summary": rho_summary,
     }
