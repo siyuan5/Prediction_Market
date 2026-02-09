@@ -1,0 +1,91 @@
+Test 1: Baseline parameters (seed=42,ground_truth=0.70, n_agents=50, n_rounds=100, initial_cash=100.0, sigma=0.10, rho_values=None, b=100.0,)
+Output - 
+
+Phase 1 complete
+Mean initial belief: 0.7091
+Final price: 1.0000
+Final error vs P*: 0.3000
+Avg positions by rho:
+  rho=0.5: avg_shares=132.4175, avg_cash=-32.08
+  rho=1.0: avg_shares=85.7361, avg_cash=15.19
+  rho=2.0: avg_shares=46.6159, avg_cash=56.47
+
+Test 2: Baseline parameters w/ liquidity(b) adjusted to 500
+Phase 1 complete
+Mean initial belief: 0.7091
+Final price: 0.9999
+Final error vs P*: 0.2999
+Avg positions by rho:
+  rho=0.5: avg_shares=132.4175, avg_cash=-25.09
+  rho=1.0: avg_shares=85.7361, avg_cash=22.15
+  rho=2.0: avg_shares=46.6159, avg_cash=58.69
+
+Test 3: Baseline parameters w/ liquidity(b) adjusted to 1000
+Output - 
+
+Phase 1 complete
+Mean initial belief: 0.7091
+Final price: 0.0000
+Final error vs P*: 0.7000
+Avg positions by rho:
+  rho=0.5: avg_shares=1453.0887, avg_cash=-14.99
+  rho=1.0: avg_shares=-1897.7009, avg_cash=170.89
+  rho=2.0: avg_shares=-476.3144, avg_cash=179.07
+
+Test 4: Baseline parameters w/ cash adjusted to 250
+
+Phase 1 complete
+Mean initial belief: 0.7091
+Final price: 1.0000
+Final error vs P*: 0.3000
+Avg positions by rho:
+  rho=0.5: avg_shares=331.0438, avg_cash=-81.04
+  rho=1.0: avg_shares=214.3402, avg_cash=35.86
+  rho=2.0: avg_shares=116.5397, avg_cash=137.82
+
+Test 5: Baseline parameters w/ rho values adjusted to [0.75, 1.0, 1.25, 1.5, 2.0]
+
+Phase 1 complete
+Mean initial belief: 0.7091
+Final price: 1.0000
+Final error vs P*: 0.3000
+Avg positions by rho:
+  rho=0.75: avg_shares=104.4614, avg_cash=-4.45
+  rho=1.0: avg_shares=78.5049, avg_cash=21.89
+  rho=1.25: avg_shares=68.7694, avg_cash=31.36
+  rho=1.5: avg_shares=57.8715, avg_cash=47.45
+  rho=2.0: avg_shares=50.9795, avg_cash=49.02
+
+Test 6: Baseline parameters w/ liquidity set to 4000 & rho values adjusted to [0.75, 1.0, 1.25, 1.5, 2.0]
+
+Phase 1 complete
+Mean initial belief: 0.7091
+Final price: 0.6079
+Final error vs P*: 0.0921
+Avg positions by rho:
+  rho=0.75: avg_shares=53.4764, avg_cash=59.66
+  rho=1.0: avg_shares=31.3452, avg_cash=58.62
+  rho=1.25: avg_shares=33.6404, avg_cash=91.84
+  rho=1.5: avg_shares=35.4723, avg_cash=108.49
+  rho=2.0: avg_shares=20.9704, avg_cash=62.22
+
+Test 7: Baseline parameters w/ liquidity set to 3500 & rho values adjusted to [0.75, 1.0, 1.25, 1.5, 2.0]
+
+Phase 1 complete
+Mean initial belief: 0.7091
+Final price: 1.0000
+Final error vs P*: 0.3000
+Avg positions by rho:
+  rho=0.75: avg_shares=14973.3094, avg_cash=-14123.54
+  rho=1.0: avg_shares=1858.0361, avg_cash=-1869.02
+  rho=1.25: avg_shares=-371.3153, avg_cash=326.08
+  rho=1.5: avg_shares=-501.2889, avg_cash=601.90
+  rho=2.0: avg_shares=-51.8358, avg_cash=73.65
+
+The agents do not always trade until the market price converges to the mean of their initial beliefs. 
+In the tests, low liquidity (b=100 or 500) leads the final price to go to 1. Very high liquidity (b=1000 or 3500) can make the price go to 0 or create extremely large positions. 
+The closest the market got to the mean initial belief of 0.7091 was with b around 4000 and rho values [0.75, 1.0, 1.25, 1.5, 2.0], where the final price was 0.6079. 
+Changing cash alone or rho alone does not reliably make the price converge to the mean belief.
+
+Increasing rho makes agents more risk-averse. Agents with lower rho (less risk-averse) hold larger positions in the market, while agents with higher rho (more risk-averse) hold fewer shares and keep more cash. 
+This confirms that risk aversion affects final position sizes, with more risk-averse agents trading less aggressively.

@@ -1,4 +1,4 @@
-from market_logic import LMSRMarketMaker
+from team_a_market_logic import LMSRMarketMaker
 
 def test():
     # initialize with b=100

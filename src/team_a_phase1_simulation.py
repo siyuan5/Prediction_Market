@@ -1,7 +1,7 @@
 import numpy as np
 
 from crra_agent import CRRAAgent
-from market_logic import LMSRMarketMaker
+from team_a_market_logic import LMSRMarketMaker
 
 
 def clipped_gaussian(mean, sigma, size, low=0.01, high=0.99, rng=None):
