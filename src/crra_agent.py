@@ -67,3 +67,24 @@ class CRRAAgent:
         """
         self.cash -= trade_cost
         self.shares += trade_shares
+
+    def update_belief(self, signal_s, *, method="beta", w=0.10, prior_strength=20.0, obs_strength=5.0):
+        """
+        Phase 2: update internal belief using public noisy signal S_t.
+
+        method:
+          - "weighted": p <- (1-w)p + w*S_t
+          - "beta": Beta pseudo-count update (stable + interpretable)
+        """
+        from phase2_utils import update_belief_weighted, update_belief_beta
+
+        if method == "weighted":
+            self.belief = update_belief_weighted(self.belief, float(signal_s), float(w))
+        elif method == "beta":
+            self.belief = update_belief_beta(
+                self.belief, float(signal_s),
+                prior_strength=float(prior_strength),
+                obs_strength=float(obs_strength),
+            )
+        else:
+            raise ValueError(f"Unknown method={method!r}")
