@@ -1,6 +1,8 @@
 import os
 import sys
 import csv
+import pandas as pd
+import matplotlib.pyplot as plt
 from itertools import product
 
 # Allow importing from /src when running from repo root
@@ -69,6 +71,61 @@ def main():
         writer.writerows(rows)
 
     print(f"Wrote sweep summary: {out_path}")
+    output_graphs(rows)
+
+def output_graphs(rows):
+    df = pd.DataFrame(rows)
+
+    for sigma in sorted(df["sigma"].unique()):
+        subset = df[df["sigma"] == sigma]
+        plt.plot(
+            subset["b"],
+            subset["avg_final_error"],
+            marker="o",
+            label=f"sigma={sigma}"
+        )
+
+    plt.xlabel("Liquidity Parameter b")
+    plt.ylabel("Average Final Error")
+    plt.title("Final Error vs Liquidity (b)")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("outputs/error_vs_b.png")
+    plt.clf()
+
+    for b in sorted(df["b"].unique()):
+        subset = df[df["b"] == b]
+        plt.plot(
+            subset["sigma"],
+            subset["avg_final_error"],
+            marker="o",
+            label=f"b={b}"
+        )
+
+    plt.xlabel("Initial Belief Dispersion (sigma)")
+    plt.ylabel("Average Final Error")
+    plt.title("Final Error vs Belief Dispersion")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("outputs/error_vs_sigma.png")
+    plt.clf()
+
+    for sigma in sorted(df["sigma"].unique()):
+        subset = df[df["sigma"] == sigma]
+        plt.plot(
+            subset["b"],
+            subset["avg_final_price"],
+            marker="o",
+            label=f"sigma={sigma}"
+        )
+
+    plt.xlabel("Liquidity Parameter b")
+    plt.ylabel("Average Final Price")
+    plt.title("Final Price vs Liquidity (b)")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("outputs/price_vs_b.png")
+    plt.clf()
 
 
 if __name__ == "__main__":
