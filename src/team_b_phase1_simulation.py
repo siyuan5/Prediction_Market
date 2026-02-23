@@ -228,3 +228,39 @@ def analyze_team_b_rho_effect(
         )
 
     return analysis
+
+
+def estimate_required_rounds_phase1(
+    *,
+    n_seeds=30,
+    percentile=95,
+    n_rounds_cap=2000,
+    **phase1_kwargs,
+):
+    """
+    Run Phase 1 over multiple seeds and return stats on rounds needed to converge.
+    Use the returned recommended_n_rounds when you need a fixed n_rounds budget.
+    """
+    rounds_list = []
+    converged_list = []
+    for seed in range(n_seeds):
+        result = run_team_b_phase1(
+            seed=seed,
+            n_rounds=n_rounds_cap,
+            **phase1_kwargs,
+        )
+        rounds_list.append(result["rounds_run"])
+        converged_list.append(result["converged"])
+
+    rounds_arr = np.asarray(rounds_list, dtype=float)
+    recommended = int(np.percentile(rounds_arr, percentile))
+    return {
+        "mean_rounds": float(np.mean(rounds_arr)),
+        "std_rounds": float(np.std(rounds_arr)),
+        "min_rounds": int(rounds_arr.min()),
+        "max_rounds": int(rounds_arr.max()),
+        "percentile_rounds": recommended,
+        "percentile_used": percentile,
+        "convergence_rate": sum(converged_list) / n_seeds,
+        "recommended_n_rounds": recommended,
+    }

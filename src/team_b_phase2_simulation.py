@@ -214,3 +214,49 @@ def run_team_b_phase2(
         "final_beliefs": final_beliefs,
     }
 
+
+def estimate_required_rounds_phase2(
+    *,
+    n_seeds=20,
+    n_rounds_cap=200,
+    error_threshold=0.05,
+    percentile=95,
+    **phase2_kwargs,
+):
+    """
+    Run Phase 2 over multiple seeds with n_rounds_cap and report how many rounds
+    are needed for |price - P*| to reach error_threshold (at least once).
+    Returns recommended_n_rounds as the given percentile of those rounds.
+    """
+    rounds_to_threshold = []
+    final_errors = []
+    for seed in range(n_seeds):
+        result = run_team_b_phase2(
+            seed=seed,
+            n_rounds=n_rounds_cap,
+            **phase2_kwargs,
+        )
+        err_series = result["error_series"]
+        final_errors.append(result["final_error"])
+        # First round (1-based) at which error <= threshold
+        hit = None
+        for t, e in enumerate(err_series):
+            if e <= error_threshold:
+                hit = t + 1
+                break
+        if hit is not None:
+            rounds_to_threshold.append(hit)
+    rounds_arr = np.asarray(rounds_to_threshold) if rounds_to_threshold else np.array([n_rounds_cap])
+    recommended = int(np.percentile(rounds_arr, percentile))
+    return {
+        "mean_rounds_to_threshold": float(np.mean(rounds_arr)),
+        "std_rounds_to_threshold": float(np.std(rounds_arr)) if len(rounds_arr) > 1 else 0.0,
+        "percentile_rounds": recommended,
+        "percentile_used": percentile,
+        "error_threshold": error_threshold,
+        "runs_that_hit_threshold": len(rounds_to_threshold),
+        "n_seeds": n_seeds,
+        "mean_final_error": float(np.mean(final_errors)),
+        "recommended_n_rounds": min(recommended, n_rounds_cap),
+    }
+
