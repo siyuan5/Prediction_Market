@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
 from crra_agent import CRRAAgent
 from team_b_crra_agent import TeamBCRRAAgent
 

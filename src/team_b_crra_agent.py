@@ -106,7 +106,10 @@ class TeamBCRRAAgent:
         self.shares += float(trade_shares)
 
     def update_belief(self, signal_s, *, method="beta", w=0.10, prior_strength=20.0, obs_strength=5.0):
-        from phase2_utils import update_belief_weighted, update_belief_beta
+        try:
+            from .phase2_utils import update_belief_weighted, update_belief_beta
+        except ImportError:
+            from phase2_utils import update_belief_weighted, update_belief_beta
 
         if method == "weighted":
             self.belief = update_belief_weighted(self.belief, float(signal_s), float(w))
@@ -118,4 +121,3 @@ class TeamBCRRAAgent:
             )
         else:
             raise ValueError(f"Unknown method={method!r}")
-
