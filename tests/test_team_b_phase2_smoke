@@ -1,0 +1,61 @@
+import math
+import sys
+from pathlib import Path
+
+# Ensure src/ is importable when running pytest from repo root
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from phase2_utils import SignalSpec
+from team_b_phase2_simulation import run_team_b_phase2
+
+
+def test_team_b_phase2_smoke_shapes_bounds_and_error_consistency():
+    params = dict(
+        seed=0,
+        ground_truth=0.70,
+        n_agents=30,
+        n_rounds=40,
+        initial_cash=100.0,
+        sigma=0.10,
+        fixed_rho=2.0,
+        signal_spec=SignalSpec(mode="binomial", n=25),
+        belief_update_method="beta",
+        order_policy="hybrid",
+        limit_offset=0.01,
+        market_order_edge=0.08,
+        shuffle_agents=False,  # helps reproducibility/debugging
+    )
+
+    r = run_team_b_phase2(**params)
+
+    # Correct run length
+    assert r["rounds_run"] == params["n_rounds"]
+
+    # Series lengths are consistent
+    T = r["rounds_run"]
+    assert len(r["price_series"]) == T
+    assert len(r["signal_series"]) == T
+    assert len(r["mean_belief_series"]) == T
+    assert len(r["error_series"]) == T
+    assert len(r["trade_volume"]) == T
+    assert len(r["trade_count"]) == T
+    assert len(r["best_bid_series"]) == T
+    assert len(r["best_ask_series"]) == T
+    assert len(r["mid_price_series"]) == T
+
+    # Values stay in valid ranges
+    assert all(0.001 <= q <= 0.999 for q in r["price_series"])
+    assert all(0.01 <= b <= 0.99 for b in r["mean_belief_series"])
+    assert all(0.0 <= s <= 1.0 for s in r["signal_series"])  # binomial signal is in [0,1]
+
+    # error_series must equal |price - P*| each round
+    gt = r["ground_truth"]
+    for q, e in zip(r["price_series"], r["error_series"]):
+        assert math.isclose(e, abs(q - gt), rel_tol=0, abs_tol=1e-12)
+
+    # final_price and final_error match the last elements
+    assert math.isclose(r["final_price"], r["price_series"][-1], rel_tol=0, abs_tol=1e-12)
+    assert math.isclose(r["final_error"], abs(r["final_price"] - gt), rel_tol=0, abs_tol=1e-12)
