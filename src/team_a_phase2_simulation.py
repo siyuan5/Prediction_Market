@@ -27,9 +27,10 @@ def run_phase2(
     belief_update_method="beta",
     belief_weight=0.10,
     prior_strength=20.0,
-    obs_strength=5.0,
+    obs_strength=10.0,
     min_trade_size=1e-9,
     shuffle_agents=False,
+    trade_fraction=0.20,
 ):
     # fixed seed for repeatable runs
     rng = np.random.default_rng(seed)
@@ -79,7 +80,6 @@ def run_phase2(
             )
 
         round_volume = 0.0
-        q_t = market.get_price()
 
         if shuffle_agents:
             order = rng.permutation(len(agents))
@@ -88,7 +88,9 @@ def run_phase2(
 
         for idx in order:
             agent = agents[idx]
-            x_star = agent.get_optimal_trade(q_t)
+            # each agent sees the price after all preceding trades this round
+            q_t = market.get_price()
+            x_star = agent.get_optimal_trade(q_t) * trade_fraction
             if abs(x_star) < min_trade_size:
                 continue
             trade_cost = market.calculate_trade_cost(x_star)

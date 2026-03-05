@@ -16,11 +16,12 @@ def main():
         initial_cash=100.0,
         sigma=0.10,
         rho_values=[0.75, 1.0, 1.25, 1.5, 2.0],
-        b=4000.0,
+        b=500.0,
         signal_spec=SignalSpec(mode="binomial", n=25),
         belief_update_method="beta",
         prior_strength=20.0,
-        obs_strength=5.0,
+        obs_strength=10.0,
+        trade_fraction=0.20,
         shuffle_agents=False,
     )
 
