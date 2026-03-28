@@ -64,6 +64,27 @@ Use this for the deliverable’s rho analysis quickly.
 ### 4) `<run>.json`
 Full raw results (includes the arrays used to build the CSVs).
 
+## Web UI (React) + API
+
+The `frontend/` app talks to `api/main.py`. Run **both** from the repo root (two terminals).
+
+**Backend** — install API deps once:
+
+```bash
+pip install -r requirements-api.txt
+python -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+**Frontend** — install and dev server (proxies `/api` to port 8000):
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open the URL Vite prints (usually `http://127.0.0.1:5173`). Production build: `npm run build` in `frontend/` (serve `frontend/dist/` behind the same origin as the API, or set your own API base URL).
+
 ## Notes
 - Ground truth `P*` is controlled by the `ground_truth` parameter in `run_phase1` (see `src/team_a_phase1_simulation.py`).
 - Liquidity is controlled by `b` (higher b generally means prices move less per unit trade).

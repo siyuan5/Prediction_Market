@@ -8,3 +8,5 @@ dist/
 build/
 *.egg-info/
 outputs/
+node_modules/
+frontend/dist/
