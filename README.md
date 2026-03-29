@@ -141,6 +141,32 @@ npm run dev
 
 Open the URL printed by Vite (typically `http://127.0.0.1:5173`). For production, build with `npm run build` and serve `frontend/dist/`.
 
+### Local LLM comments (Ollama)
+
+The API can generate **event-specific** trader comments by calling a **local** [Ollama](https://ollama.com) server. There is **no cloud API key or per-token cost**; comments fall back to built-in templates if Ollama is unavailable.
+
+1. **Install Ollama** for your OS and ensure the app is running (it listens on **`http://127.0.0.1:11434`** by default).
+2. **Pull a model** the API can use (name must match `OLLAMA_MODEL`):
+
+   ```bash
+   ollama pull llama3.2
+   ```
+
+3. **Restart the FastAPI process** after changing environment variables.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `COMMENT_USE_LLM` | on (`1`) | Set to `0`, `false`, or `no` to always use template comments (faster, no Ollama). |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama server URL. |
+| `OLLAMA_MODEL` | `llama3.2` | Model tag as shown by `ollama list`. |
+| `OLLAMA_TIMEOUT` | `8` | Seconds per LLM request before falling back to a template for that slot. |
+| `COMMENT_LLM_MAX` | `15` | Max **Ollama calls** per full simulation or per interactive session (counts failed attempts so a dead server cannot stall the run). |
+| `COMMENT_MAX_TOTAL` | `15` | Max **comments** stored per event (`0` = unlimited). |
+
+**Python:** no extra packages are required for Ollama; the API uses the standard library (`urllib`).
+
+**UI:** each comment is tagged **LLM** or **template**. A streamed or full **Run simulation** updates charts and comments incrementally when possible.
+
 ---
 
 ## Notes
