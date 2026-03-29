@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from itertools import product
 
-# Allow importing from /src when running from repo root
+# Ensure the project src directory is on sys.path for local imports, regardless of working directory
 ROOT = os.path.abspath(os.path.dirname(__file__))
 SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
@@ -16,21 +16,23 @@ from team_a_phase2_simulation import run_phase2
 
 
 def main():
-    # Simple sweep: vary rho grid + signal noise (sigma)
+    # Grid search over agent heterogeneity (rho), signal noise (sigma), and market liquidity (b)
     rho_grids = [
-        [0.75, 1.0, 1.25],          # baseline-ish
-        [0.5, 1.0, 2.0],            # wider heterogeneity
+        [0.75, 1.0, 1.25],          # moderate heterogeneity, centered around 1
+        [0.5, 1.0, 2.0],            # more diverse agent signal reliability
     ]
-    sigmas = [0.05, 0.10, 0.20]
-    bs = [200.0, 500.0, 2000.0]
-    seeds = [0, 1, 2, 3, 4]         # average over a few seeds
+    sigmas = [0.05, 0.10, 0.20]     # signal noise levels
+    bs = [200.0, 500.0, 2000.0]     # LMSR liquidity parameter values
+    seeds = [0, 1, 2, 3, 4]         # use multiple seeds for mean/stability
 
     out_path = "outputs/team_a_phase2_sweep_summary.csv"
 
     rows = []
+    # Iterate over all parameter combinations
     for rho_values, sigma, b in product(rho_grids, sigmas, bs):
         final_prices = []
         final_errors = []
+        # Repeat experiment for each random seed, aggregate results
         for seed in seeds:
             r = run_phase2(
                 seed=seed,
@@ -45,16 +47,17 @@ def main():
                 belief_update_method="beta",
                 prior_strength=20.0,
                 obs_strength=5.0,
-                shuffle_agents=False,
+                shuffle_agents=False,  # deterministic agent order for reproducibility
             )
             final_prices.append(r["final_price"])
             final_errors.append(r["final_error"])
 
+        # Compute mean results for this parameter setting
         avg_price = sum(final_prices) / len(final_prices)
         avg_err = sum(final_errors) / len(final_errors)
 
         rows.append({
-            "rho_values": str(rho_values),
+            "rho_values": str(rho_values),  # store as string for CSV readability
             "sigma": sigma,
             "b": b,
             "seeds": str(seeds),
@@ -64,7 +67,7 @@ def main():
             "max_final_error": max(final_errors),
         })
 
-    # Write CSV
+    # Write sweep results to CSV so they can be easily inspected or plotted elsewhere
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -74,8 +77,10 @@ def main():
     output_graphs(rows)
 
 def output_graphs(rows):
+    # Plot experiment results across key parameter axes for visual analysis
     df = pd.DataFrame(rows)
 
+    # Final error vs. liquidity for each sigma value
     for sigma in sorted(df["sigma"].unique()):
         subset = df[df["sigma"] == sigma]
         plt.plot(
@@ -93,6 +98,7 @@ def output_graphs(rows):
     plt.savefig("outputs/error_vs_b.png")
     plt.clf()
 
+    # Final error vs. signal noise for each liquidity value
     for b in sorted(df["b"].unique()):
         subset = df[df["b"] == b]
         plt.plot(
@@ -110,6 +116,7 @@ def output_graphs(rows):
     plt.savefig("outputs/error_vs_sigma.png")
     plt.clf()
 
+    # Final average price vs. liquidity for each sigma
     for sigma in sorted(df["sigma"].unique()):
         subset = df[df["sigma"] == sigma]
         plt.plot(

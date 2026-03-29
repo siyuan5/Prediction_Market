@@ -6,14 +6,22 @@ import numpy as np
 
 
 def _ensure_dir(path: Path) -> None:
+    """Create directory (including parents) if it does not already exist."""
     path.mkdir(parents=True, exist_ok=True)
 
 
 def _build_rho_summary_from_arrays(results: Dict[str, Any]) -> Dict[float, Dict[str, float]]:
+    """
+    Compute per-rho statistics (average shares and cash) from flat arrays.
+    Returns a mapping: rho value -> {"avg_shares": ..., "avg_cash": ...}
+
+    Meant for runs that do not compute rho summary upfront.
+    """
     rhos: List[float] = list(results.get("final_rhos", []))
     shares: List[float] = list(results.get("final_positions", []))
     cash: List[float] = list(results.get("final_cash", []))
 
+    # Group agent results by unique rho value
     rho_groups: Dict[float, Dict[str, List[float]]] = {}
     n = min(len(rhos), len(shares), len(cash))
     for i in range(n):
@@ -23,6 +31,7 @@ def _build_rho_summary_from_arrays(results: Dict[str, Any]) -> Dict[float, Dict[
         rho_groups[rho]["shares"].append(float(shares[i]))
         rho_groups[rho]["cash"].append(float(cash[i]))
 
+    # For each rho, compute group mean for shares and cash
     rho_summary: Dict[float, Dict[str, float]] = {}
     for rho, data in rho_groups.items():
         rho_summary[rho] = {
@@ -38,31 +47,31 @@ def export_phase1_results(
     out_dir: str = "outputs",
     run_name: str = "phase1_run",
 ) -> Dict[str, str]:
-    """Export a Phase 1 run (dict returned by run_phase1) into JSON + CSVs.
+    """
+    Export full results of a Phase 1 simulation run (see run_phase1) as JSON 
+    and relevant CSV files. Returns mapping: artifact label -> file path.
 
-    Writes:
-      - <run_name>.json (full results)
-      - <run_name>_timeseries.csv (round, price, error, volume)
-      - <run_name>_agents.csv (agent_id, rho, final_shares, final_cash)
-      - <run_name>_rho_summary.csv (rho, avg_shares, avg_cash)
-
-    Returns a map of artifact name -> path string.
+    Output files:
+      - <run_name>.json:      Complete results (raw dict)
+      - <run_name>_timeseries.csv:  Market price/error/volume per round
+      - <run_name>_agents.csv:      Agent final (rho, shares, cash)
+      - <run_name>_rho_summary.csv: Per-rho aggregated agent stats
     """
     out_path = Path(out_dir)
     _ensure_dir(out_path)
 
-    # ---------- JSON (full results) ----------
+    # ---- Serialize full run to JSON ----
     json_path = out_path / f"{run_name}.json"
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
-    # ---------- Time series ----------
+    # ---- Time series: one row per round ----
     ts_path = out_path / f"{run_name}_timeseries.csv"
     price_series: List[float] = list(results.get("price_series", []))
     error_series: List[float] = list(results.get("error_series", []))
     trade_volume: List[float] = list(results.get("trade_volume", []))
 
-    n = max(len(price_series), len(error_series), len(trade_volume))
+    n = max(len(price_series), len(error_series), len(trade_volume))  # ensures correct # of rounds written
     with ts_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["round", "price", "abs_error_vs_ground_truth", "trade_volume"])
@@ -72,13 +81,13 @@ def export_phase1_results(
             vol = trade_volume[t] if t < len(trade_volume) else ""
             w.writerow([t, price, err, vol])
 
-    # ---------- Agent finals ----------
+    # ---- Agent outcomes: one row per agent ----
     agents_path = out_path / f"{run_name}_agents.csv"
     rhos: List[float] = list(results.get("final_rhos", []))
     shares: List[float] = list(results.get("final_positions", []))
     cash: List[float] = list(results.get("final_cash", []))
 
-    m = max(len(rhos), len(shares), len(cash))
+    m = max(len(rhos), len(shares), len(cash))  # ensure rows for all tracked arrays
     with agents_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["agent_id", "rho", "final_shares", "final_cash"])
@@ -90,13 +99,14 @@ def export_phase1_results(
                 cash[i] if i < len(cash) else "",
             ])
 
-    #  rho summary
+    # ---- Per-rho summary (average per group) ----
     rho_sum_path = out_path / f"{run_name}_rho_summary.csv"
+    # If precomputed, use it; else, derive from agent arrays
     rho_summary: Dict[Any, Dict[str, float]] = results.get("rho_summary", {})  # type: ignore
     if not rho_summary:
         rho_summary = _build_rho_summary_from_arrays(results)
 
-    # keys might be floats; normalize for sorting
+    # Normalize keys (rho) for sorting in CSV output
     items = sorted(rho_summary.items(), key=lambda kv: float(kv[0]))
     with rho_sum_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -118,21 +128,22 @@ def export_phase2_results(
     out_dir: str = "outputs",
     run_name: str = "phase2_run",
 ) -> Dict[str, str]:
-    """Export a Phase 2 run into JSON + CSVs.
-
-    Writes:
-      - <run_name>.json (full results)
-      - <run_name>_timeseries.csv
-      - <run_name>_agents.csv
-      - <run_name>_rho_summary.csv
+    """
+    Export Phase 2 simulation results as JSON and several detailed CSV artifacts:
+      - full results
+      - per time step (including mean belief, signal, and inventory position metrics)
+      - agent outcomes
+      - rho summary
     """
     out_path = Path(out_dir)
     _ensure_dir(out_path)
 
+    # Write main JSON (all outputs)
     json_path = out_path / f"{run_name}.json"
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
+    # ---- Export per-round series ----
     ts_path = out_path / f"{run_name}_timeseries.csv"
     price_series: List[float] = list(results.get("price_series", []))
     error_series: List[float] = list(results.get("error_series", []))
@@ -141,6 +152,7 @@ def export_phase2_results(
     mean_belief_series: List[float] = list(results.get("mean_belief_series", []))
     inventory_series: List[List[float]] = list(results.get("inventory_series", []))
 
+    # Number of rounds taken as max of all available metrics (robust to missing data)
     n = max(
         len(price_series),
         len(error_series),
@@ -171,16 +183,18 @@ def export_phase2_results(
             err = error_series[t] if t < len(error_series) else ""
             vol = trade_volume[t] if t < len(trade_volume) else ""
 
+            # LMSR market may have inventory for both Q=1 and Q=0 outcomes
             q1 = ""
             q0 = ""
             if t < len(inventory_series):
                 inv = inventory_series[t]
                 if isinstance(inv, list) and len(inv) >= 2:
-                    q1 = inv[0]
-                    q0 = inv[1]
+                    q1 = inv[0]  # shares in Q=1 state
+                    q0 = inv[1]  # shares in Q=0 state
 
             w.writerow([t, price, signal, mean_belief, err, vol, q1, q0])
 
+    # ---- Export agent outcomes (final) ----
     agents_path = out_path / f"{run_name}_agents.csv"
     rhos: List[float] = list(results.get("final_rhos", []))
     shares: List[float] = list(results.get("final_positions", []))
@@ -202,6 +216,7 @@ def export_phase2_results(
                 ]
             )
 
+    # ---- Write rho-aggregated summary from agent outcomes ----
     rho_sum_path = out_path / f"{run_name}_rho_summary.csv"
     rho_summary: Dict[float, Dict[str, float]] = _build_rho_summary_from_arrays(results)
     items = sorted(rho_summary.items(), key=lambda kv: float(kv[0]))

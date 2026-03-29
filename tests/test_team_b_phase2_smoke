@@ -2,7 +2,7 @@ import math
 import sys
 from pathlib import Path
 
-# Ensure src/ is importable when running pytest from repo root
+# Support running with pytest from repo root: add src/ to sys.path for imports
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -13,6 +13,7 @@ from team_b_phase2_simulation import run_team_b_phase2
 
 
 def test_team_b_phase2_smoke_shapes_bounds_and_error_consistency():
+    # Parameters for a simple end-to-end Team B Phase 2 simulation; tuned for smoke test
     params = dict(
         seed=0,
         ground_truth=0.70,
@@ -26,15 +27,15 @@ def test_team_b_phase2_smoke_shapes_bounds_and_error_consistency():
         order_policy="hybrid",
         limit_offset=0.01,
         market_order_edge=0.08,
-        shuffle_agents=False,  # helps reproducibility/debugging
+        shuffle_agents=False,  # deterministic order for reproducibility
     )
 
     r = run_team_b_phase2(**params)
 
-    # Correct run length
+    # Simulation should run for expected number of rounds
     assert r["rounds_run"] == params["n_rounds"]
 
-    # Series lengths are consistent
+    # All per-round results should have shape [rounds_run]
     T = r["rounds_run"]
     assert len(r["price_series"]) == T
     assert len(r["signal_series"]) == T
@@ -46,16 +47,18 @@ def test_team_b_phase2_smoke_shapes_bounds_and_error_consistency():
     assert len(r["best_ask_series"]) == T
     assert len(r["mid_price_series"]) == T
 
-    # Values stay in valid ranges
+    # Validate price bounds: simulation should avoid degenerate prices near 0/1
     assert all(0.001 <= q <= 0.999 for q in r["price_series"])
+    # Mean belief also bounded well away from 0/1 to avoid numerical issues
     assert all(0.01 <= b <= 0.99 for b in r["mean_belief_series"])
-    assert all(0.0 <= s <= 1.0 for s in r["signal_series"])  # binomial signal is in [0,1]
+    # Signals for binomial generator always in [0, 1]
+    assert all(0.0 <= s <= 1.0 for s in r["signal_series"])
 
-    # error_series must equal |price - P*| each round
+    # Error series should always be the absolute difference |price - ground truth| per round
     gt = r["ground_truth"]
     for q, e in zip(r["price_series"], r["error_series"]):
         assert math.isclose(e, abs(q - gt), rel_tol=0, abs_tol=1e-12)
 
-    # final_price and final_error match the last elements
+    # final_price equals the final value in price_series; final_error is final price's error to ground truth
     assert math.isclose(r["final_price"], r["price_series"][-1], rel_tol=0, abs_tol=1e-12)
     assert math.isclose(r["final_error"], abs(r["final_price"] - gt), rel_tol=0, abs_tol=1e-12)

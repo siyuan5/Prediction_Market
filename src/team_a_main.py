@@ -3,9 +3,10 @@ from team_a_phase1_simulation import run_phase1
 from export_utils import export_phase1_results
 
 def run_test(run_name="phase1_run", **kwargs):
+    # Run a single Phase 1 simulation with given parameters (kwargs)
     results = run_phase1(**kwargs)
 
-    # export JSON + CSVs
+    # Export results to JSON and multiple CSV artifact files
     paths = export_phase1_results(results, out_dir="outputs", run_name=run_name)
     print(f"Exported: {paths}")
 
@@ -14,12 +15,14 @@ def run_test(run_name="phase1_run", **kwargs):
     print(f"Final price: {results['final_price']:.4f}")
     print(f"Final error vs P*: {results['final_error']:.4f}")
     print("Avg positions by rho:")
+    # Print average final share position & cash for each risk aversion level (rho)
     for rho, summary in sorted(results["rho_summary"].items()):
         avg_shares = summary["avg_shares"]
         avg_cash = summary["avg_cash"]
         print(f"  rho={rho}: avg_shares={avg_shares:.4f}, avg_cash={avg_cash:.2f}")
 
 def main():
+    # Run a series of Phase 1 simulation test cases varying market and agent parameters
     run_test(run_name="test1_baseline")
     run_test(run_name="test2_b500", b=500)
     run_test(run_name="test3_b500_repeat", b=500)

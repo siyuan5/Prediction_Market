@@ -1,5 +1,6 @@
 import numpy as np
 
+# Support both relative and direct imports so module runs both as script and package
 try:
     from .phase2_utils import SignalSpec, generate_signal
     from .team_b_crra_agent import TeamBCRRAAgent
@@ -11,6 +12,10 @@ except ImportError:
 
 
 def clipped_gaussian(mean, sigma, size, low=0.01, high=0.99, rng=None):
+    """
+    Generate samples from a Gaussian clipped to [low, high].
+    Defaults to using a new random generator if none supplied.
+    """
     if rng is None:
         rng = np.random.default_rng()
     samples = rng.normal(loc=mean, scale=sigma, size=size)
@@ -18,6 +23,9 @@ def clipped_gaussian(mean, sigma, size, low=0.01, high=0.99, rng=None):
 
 
 def _apply_trades(trades, agents_by_id):
+    """
+    Update agent portfolios according to executed trades and return total round volume.
+    """
     volume = 0.0
     for trade in trades:
         quantity = trade.quantity
@@ -26,6 +34,7 @@ def _apply_trades(trades, agents_by_id):
         buyer = agents_by_id[trade.buyer_id]
         seller = agents_by_id[trade.seller_id]
 
+        # Update buyer and seller portfolios based on trade direction
         buyer.update_portfolio(trade_shares=quantity, trade_cost=notional)
         seller.update_portfolio(trade_shares=-quantity, trade_cost=-notional)
         volume += quantity
@@ -56,19 +65,27 @@ def run_team_b_phase2(
     limit_offset=0.01,
     market_order_edge=0.08,
 ):
+    """
+    Simulates Phase 2: dynamic beliefs with signals and belief-updates.
+    Runs a multi-agent CDA with CRRA agents updating beliefs in response to noisy signals.
+    """
     rng = np.random.default_rng(seed)
 
+    # Set up heterogeneity in CRRA parameter ("risk aversion"), if not fixed
     if rho_values is None:
         rho_values = [0.5, 1.0, 2.0]
+    # Default: binomial signal of size 25 (user can override via signal_spec)
     if signal_spec is None:
         signal_spec = SignalSpec(mode="binomial", n=25)
 
+    # Each agent starts with a different (clipped normal) initial belief centered at ground truth
     beliefs = clipped_gaussian(ground_truth, sigma, n_agents, rng=rng)
     if fixed_rho is None:
         rhos = rng.choice(rho_values, size=n_agents, replace=True)
     else:
         rhos = np.full(n_agents, float(fixed_rho))
 
+    # Instantiate CRRA agents for each participant
     agents = [
         TeamBCRRAAgent(
             agent_id=i,
@@ -80,12 +97,14 @@ def run_team_b_phase2(
     ]
     agents_by_id = {agent.id: agent for agent in agents}
 
+    # Initialize CDA exchange with given tick size/initial price
     exchange = ContinuousDoubleAuction(
         tick_size=tick_size,
         initial_reference_price=initial_price,
     )
     mean_initial_belief = float(np.mean(beliefs))
 
+    # Track time series and outcomes for diagnostics/metrics
     price_series = []
     signal_series = []
     mean_belief_series = []
@@ -96,15 +115,17 @@ def run_team_b_phase2(
     best_ask_series = []
     mid_price_series = []
 
-    idle_rounds = 0
+    idle_rounds = 0     # Counts consecutive rounds with < min_trade_size volume
     rounds_run = 0
 
     for _ in range(n_rounds):
         rounds_run += 1
 
+        # Sample and store the round's noisy signal
         signal_t = float(generate_signal(ground_truth, rng, signal_spec))
         signal_series.append(signal_t)
 
+        # All agents update their beliefs in response to this signal
         for agent in agents:
             agent.update_belief(
                 signal_t,
@@ -117,6 +138,7 @@ def run_team_b_phase2(
         round_volume = 0.0
         round_trade_count = 0
 
+        # Trading occurs in random (or fixed) sequence to reduce order effects
         if shuffle_agents:
             order = rng.permutation(len(agents))
         else:
@@ -124,9 +146,10 @@ def run_team_b_phase2(
 
         for idx in order:
             agent = agents[idx]
-            # Maintain at most one active quote for this agent at a time.
+            # Cancel the agent's existing resting quote, so only one open order at a time
             exchange.cancel_agent_orders(agent.id)
 
+            # Compute reference price and agent's optimal order for this round
             reference_price = exchange.reference_price()
             order_spec = agent.build_order(
                 reference_price=reference_price,
@@ -138,8 +161,9 @@ def run_team_b_phase2(
                 min_trade_size=min_trade_size,
             )
             if order_spec is None:
-                continue
+                continue  # Agent chooses not to submit any order
 
+            # Submit market or limit order as specified; collect execution result
             if order_spec["type"] == "market":
                 result = exchange.submit_market_order(
                     agent_id=agent.id,
@@ -154,10 +178,12 @@ def run_team_b_phase2(
                     limit_price=order_spec["limit_price"],
                 )
 
+            # Apply trades to agent portfolios, accumulate stats
             trades = result["trades"]
             round_trade_count += len(trades)
             round_volume += _apply_trades(trades, agents_by_id)
 
+        # Track price/belief/volume and spread series for analysis/plotting
         price_t = float(exchange.reference_price())
         mean_belief_t = float(np.mean([agent.belief for agent in agents]))
 
@@ -170,14 +196,17 @@ def run_team_b_phase2(
         best_ask_series.append(exchange.best_ask())
         mid_price_series.append(exchange.mid_price())
 
+        # Idle round if trading dried up to below min_trade_size
         if round_volume <= min_trade_size:
             idle_rounds += 1
         else:
             idle_rounds = 0
 
+        # Early stop if there are too many consecutive idle (illiquid) rounds
         if max_idle_rounds is not None and idle_rounds >= int(max_idle_rounds):
             break
 
+    # Record end-of-simulation stats for all agents and output series
     final_price = float(price_series[-1]) if price_series else float(exchange.reference_price())
     final_positions = [agent.shares for agent in agents]
     final_cash = [agent.cash for agent in agents]
@@ -224,9 +253,9 @@ def estimate_required_rounds_phase2(
     **phase2_kwargs,
 ):
     """
-    Run Phase 2 over multiple seeds with n_rounds_cap and report how many rounds
-    are needed for |price - P*| to reach error_threshold (at least once).
-    Returns recommended_n_rounds as the given percentile of those rounds.
+    Runs Phase 2 simulation repeatedly to estimate rounds needed for price to reach
+    within error_threshold of ground truth (at least once), e.g., convergence speed.
+    Returns stats and a recommended round count for experiment design.
     """
     rounds_to_threshold = []
     final_errors = []
@@ -238,7 +267,7 @@ def estimate_required_rounds_phase2(
         )
         err_series = result["error_series"]
         final_errors.append(result["final_error"])
-        # First round (1-based) at which error <= threshold
+        # Find first round (1-based) when price error becomes acceptable
         hit = None
         for t, e in enumerate(err_series):
             if e <= error_threshold:
@@ -246,6 +275,8 @@ def estimate_required_rounds_phase2(
                 break
         if hit is not None:
             rounds_to_threshold.append(hit)
+
+    # If price never hit the threshold in any run, fill with cap for safety
     rounds_arr = np.asarray(rounds_to_threshold) if rounds_to_threshold else np.array([n_rounds_cap])
     recommended = int(np.percentile(rounds_arr, percentile))
     return {

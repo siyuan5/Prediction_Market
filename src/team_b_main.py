@@ -2,6 +2,7 @@ import argparse
 import sys
 from pathlib import Path
 
+# Ensure local repo dir is in the module import path for relative imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from phase2_utils import SignalSpec
 from team_b_phase1_simulation import (
@@ -11,8 +12,8 @@ from team_b_phase1_simulation import (
 )
 from team_b_phase2_simulation import estimate_required_rounds_phase2, run_team_b_phase2
 
-
 def _print_rho_table(rows):
+    # Print summary table for rho sweep experiment in Phase 1 (static beliefs)
     print("\nRho sweep (homogeneous populations, CDA order book):")
     print(
         "rho\tmean|position|\tstd|position|\tmean|final-mean belief|\tconv_rate\tmean_rounds\tmean_volume"
@@ -25,9 +26,12 @@ def _print_rho_table(rows):
             f"{row['mean_total_volume']:.2f}"
         )
 
-
 def _print_required_rounds():
-    """Estimate required n_rounds for Phase 1 and Phase 2 from multi-seed runs."""
+    """
+    Estimate and print recommended n_rounds for both phases using multi-seed simulation.
+    Outputs percentiles and convergence/stability stats for reproducibility and experiment design.
+    """
+    # Common scenario setup parameters shared by both phases
     common = dict(
         ground_truth=0.70,
         n_agents=50,
@@ -38,6 +42,7 @@ def _print_required_rounds():
         market_order_edge=0.08,
     )
     print("Estimating required rounds for Team B (multiple seeds)...")
+    # Phase 1: Find required rounds for static belief convergence
     p1 = estimate_required_rounds_phase1(
         n_seeds=30,
         percentile=95,
@@ -52,6 +57,7 @@ def _print_required_rounds():
     print(f"  Convergence rate:          {p1['convergence_rate']:.2%}")
     print(f"  Recommended n_rounds (p{p1['percentile_used']}): {p1['recommended_n_rounds']}")
 
+    # Phase 2: Find required rounds for price to track ground truth within error threshold
     p2_kw = {**common, "signal_spec": None, "belief_update_method": "beta"}
     p2 = estimate_required_rounds_phase2(
         n_seeds=20,
@@ -69,6 +75,9 @@ def _print_required_rounds():
     print()
 
 def _run_phase1(seed=42):
+    """
+    Run Team B's Phase 1 simulation with CDA, print results, and optional rho sweep stats.
+    """
     results = run_team_b_phase1(
         seed=seed,
         convergence_tol=0.01,
@@ -88,6 +97,7 @@ def _run_phase1(seed=42):
     print(f"Total executed volume: {sum(results['trade_volume']):.2f}")
     print(f"Total trades: {sum(results['trade_count'])}")
 
+    # Additional: Sweep rho for static population; summarizes how risk aversion influences market outcomes
     rho_rows = analyze_team_b_rho_effect(
         rho_values=[0.5, 1.0, 2.0, 4.0],
         n_seeds=30,
@@ -106,9 +116,12 @@ def _run_phase1(seed=42):
     )
     _print_rho_table(rho_rows)
 
-
 def _run_phase2(seed=42, signal_mode="binomial", signal_n=25, signal_sigma=0.08, belief_method="beta"):
-    """Run Phase 2: fixed P*, noisy signals S_t, belief updates; observe price tracking P*."""
+    """
+    Run Team B's Phase 2: agents get signals, update beliefs, trade in CDA. 
+    Prints outcome stats, including price-tracking of true probability.
+    """
+    # Set up the signal generator for this run
     if signal_mode == "gaussian":
         signal_spec = SignalSpec(mode="gaussian", sigma=signal_sigma)
     elif signal_mode == "bernoulli":
@@ -140,8 +153,8 @@ def _run_phase2(seed=42, signal_mode="binomial", signal_n=25, signal_sigma=0.08,
     print(f"Signal mode: {results.get('signal_mode', signal_mode)}")
     print(f"Belief update: {results['belief_update_method']}")
 
-
 def main():
+    # Argparse CLI for controlling scenario, parameters, and summary mode for experiments
     parser = argparse.ArgumentParser(
         description="Team B (CDA): Phase 1 (static beliefs) or Phase 2 (updating beliefs)."
     )
@@ -186,6 +199,7 @@ def main():
     )
     args = parser.parse_args()
 
+    # User can request estimated round count table and exit, or run actual simulation
     if args.estimate_rounds:
         _print_required_rounds()
         return

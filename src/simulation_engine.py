@@ -1,14 +1,13 @@
-# stateful sim engine for both lmsr and cda
-# lets you run in chunks, shift beliefs mid-run, and poll state
-#
-# how to use:
+# SimulationEngine: manages stateful multi-round simulations for market mechanisms (LMSR and CDA, phase 1 and 2)
+# Features chunked runs, mid-run belief shocks, polling of agent/market state, and result metrics.
+# Usage Example:
 #   engine = SimulationEngine(mechanism="lmsr", phase=2, ground_truth=0.70)
 #   engine.run(30)                          # run 30 rounds
 #   engine.shift_beliefs(new_belief=0.9)    # shock all agents
-#   engine.run(20)                          # keep going
-#   engine.get_state()                      # current snapshot
-#   engine.get_agents()                     # per-agent data
-#   engine.get_metrics()                    # full history
+#   engine.run(20)                          # continue simulation
+#   engine.get_state()                      # get state snapshot
+#   engine.get_agents()                     # get agent data
+#   engine.get_metrics()                    # get metrics/history
 
 from __future__ import annotations
 
@@ -34,8 +33,8 @@ except ImportError:
 
 class SimulationEngine:
     # mechanism: "lmsr" or "cda"
-    # phase 1 = static beliefs, phase 2 = agents get signals each round
-    # trade_fraction defaults to 1.0 for phase 1, 0.20 for phase 2
+    # phase 1 = static beliefs, phase 2 = agents get signals and update beliefs each round
+    # trade_fraction defaults to 1.0 in phase 1 (static beliefs), 0.20 in phase 2 (learning)
 
     def __init__(
         self,
@@ -48,9 +47,9 @@ class SimulationEngine:
         initial_cash: float = 100.0,
         rho_values: Optional[List[float]] = None,
         belief_spec: Optional[BeliefSpec] = None,
-        # lmsr
+        # lmsr-specific param
         b: float = 100.0,
-        # cda
+        # cda-specific params
         initial_price: float = 0.5,
         tick_size: float = 1e-4,
         order_policy: str = "hybrid",
@@ -87,7 +86,7 @@ class SimulationEngine:
         self.limit_offset = limit_offset
         self.market_order_edge = market_order_edge
 
-        # full trade in phase 1, fractional in phase 2 to avoid oscillation
+        # Use full trade in phase 1; restricted trade in phase 2 to damp instability
         if trade_fraction is None:
             self.trade_fraction = 1.0 if phase == 1 else 0.20
         else:
@@ -95,16 +94,16 @@ class SimulationEngine:
 
         self.rng = np.random.default_rng(seed)
 
+        # If not provided, use default risk parameters and belief/signal specs
         if rho_values is None:
             rho_values = [0.5, 1.0, 2.0]
         if belief_spec is None:
             belief_spec = BeliefSpec()
         if signal_spec is None:
             signal_spec = SignalSpec(mode="binomial", n=25)
-
         self.signal_spec = signal_spec
 
-        # build agents
+        # Agent setup: beliefs drawn from prior, risk preferences (rho) chosen randomly for heterogeneity
         beliefs = sample_beliefs(ground_truth, n_agents, belief_spec, self.rng)
         rhos = self.rng.choice(rho_values, size=n_agents, replace=True)
 
@@ -133,7 +132,7 @@ class SimulationEngine:
         self.initial_beliefs: List[float] = beliefs.tolist()
         self.mean_initial_belief: float = float(np.mean(beliefs))
 
-        # spin up market
+        # Market construction
         if mechanism == "lmsr":
             self.market: Any = LMSRMarketMaker(b=b)
         else:
@@ -142,7 +141,7 @@ class SimulationEngine:
                 initial_reference_price=initial_price,
             )
 
-        # full history across all segments
+        # Initialize full simulation history trackers
         self.round: int = 0
         self.price_series: List[float] = []
         self.error_series: List[float] = []
@@ -150,13 +149,17 @@ class SimulationEngine:
         self.mean_belief_series: List[float] = []
         self.signal_series: List[float] = []
         self.belief_shift_events: List[Dict[str, Any]] = []
-        # cda only
+        # CDA-specific history
         self.best_bid_series: List[Optional[float]] = []
         self.best_ask_series: List[Optional[float]] = []
 
     def run(self, n_rounds: int) -> Dict[str, Any]:
-        # run n more rounds, state carries over between calls
-        # returns metrics for this segment only
+        """
+        Run n_rounds further simulation steps. 
+        Each round: if phase 2, agents see new signal and update beliefs; then all agents trade. 
+        Series metrics are updated for each round.
+        Returns metrics recorded during this run segment only (not cumulative).
+        """
         seg_prices: List[float] = []
         seg_errors: List[float] = []
         seg_volume: List[float] = []
@@ -166,7 +169,7 @@ class SimulationEngine:
         for _ in range(n_rounds):
             self.round += 1
 
-            # phase 2: emit signal, all agents update before trading
+            # In phase 2, broadcast a signal; all agents synchronously update beliefs before trading
             if self.phase == 2:
                 signal_t = float(generate_signal(self.ground_truth, self.rng, self.signal_spec))
                 self.signal_series.append(signal_t)
@@ -185,6 +188,7 @@ class SimulationEngine:
             mean_belief_t = float(np.mean([a.belief for a in self.agents]))
             error_t = abs(price_t - self.ground_truth)
 
+            # Store round summary statistics (used for charting, diagnostic, and UI purposes)
             self.price_series.append(price_t)
             self.error_series.append(error_t)
             self.trade_volume.append(round_volume)
@@ -194,6 +198,7 @@ class SimulationEngine:
             seg_volume.append(round_volume)
             seg_mean_beliefs.append(mean_belief_t)
 
+            # CDA only: record order book best bid/ask after round
             if self.mechanism == "cda":
                 self.best_bid_series.append(self.market.best_bid())
                 self.best_ask_series.append(self.market.best_ask())
@@ -216,23 +221,27 @@ class SimulationEngine:
         agent_ids: Optional[List[int]] = None,
         rho_filter: Optional[float] = None,
     ) -> Dict[str, Any]:
-        # mid-run belief injection
-        # pass new_belief to set absolute value, or delta to nudge relative
-        # filter by agent_ids or rho_filter to target a subset
+        """
+        Mid-run belief shock: update beliefs absolutely (new_belief) or relatively (delta) for a (possibly filtered) agent subset.
+        Optional filters: by agent_ids list or exact rho value.
+        Records metrics pre/post shock in event log (for chart annotation, diagnostics, or reproducibility).
+        """
+        # Exactly one of new_belief/delta must be specified
         if (new_belief is None) == (delta is None):
             raise ValueError("pass exactly one of new_belief or delta")
 
+        # Select agents meeting the id or risk preference filter (if any)
         targets = list(self.agents)
-
         if agent_ids is not None:
             id_set = set(agent_ids)
             targets = [a for a in targets if a.id in id_set]
-
         if rho_filter is not None:
+            # Only agents with rho almost equal to the specified value
             targets = [a for a in targets if abs(a.rho - rho_filter) < 1e-9]
 
         before_mean = float(np.mean([a.belief for a in targets])) if targets else 0.0
 
+        # Apply belief shift (absolute or relative), values clipped to [0.01,0.99] to avoid extremal beliefs
         for agent in targets:
             if new_belief is not None:
                 agent.belief = float(np.clip(new_belief, 0.01, 0.99))
@@ -242,7 +251,7 @@ class SimulationEngine:
 
         after_mean = float(np.mean([a.belief for a in targets])) if targets else 0.0
 
-        # log the event so the gui can mark it on the chart
+        # Record event for GUI annotations/charting/metrics
         event: Dict[str, Any] = {
             "round": self.round,
             "n_agents_shifted": len(targets),
@@ -256,7 +265,10 @@ class SimulationEngine:
         return event
 
     def get_state(self) -> Dict[str, Any]:
-        # current round snapshot, used by api /state
+        """
+        Return current simulation state snapshot.
+        Used by API/UI to display top-level live state.
+        """
         price = self._current_price()
         return {
             "round": self.round,
@@ -270,7 +282,10 @@ class SimulationEngine:
         }
 
     def get_agents(self) -> List[Dict[str, Any]]:
-        # per-agent snapshot, used by api /agents
+        """
+        Return current agent-level snapshot (for /agents API/UI).
+        Includes P&L calculation using current price.
+        """
         price = self._current_price()
         return [
             {
@@ -285,7 +300,10 @@ class SimulationEngine:
         ]
 
     def get_metrics(self) -> Dict[str, Any]:
-        # full history across all segments, used by api /metrics
+        """
+        Return full series history for the simulation (for /metrics API/UI).
+        Includes all tracked metrics, plus best bid/ask series for CDA runs.
+        """
         result: Dict[str, Any] = {
             "total_rounds": self.round,
             "price_series": self.price_series,
@@ -303,20 +321,23 @@ class SimulationEngine:
             result["best_ask_series"] = self.best_ask_series
         return result
 
-    # internal helpers
+    # -------- Internal utility methods --------
 
     def _current_price(self) -> float:
+        # Use LMSR market price or CDA reference price, depending on mechanism
         if self.mechanism == "lmsr":
             return float(self.market.get_price())
         return float(self.market.reference_price())
 
     def _run_round(self) -> float:
+        # Dispatch to the mechanism-specific step
         if self.mechanism == "lmsr":
             return self._run_lmsr_round()
         return self._run_cda_round()
 
     def _run_lmsr_round(self) -> float:
-        # refresh price inside loop so each agent trades at post-trade price
+        # Each agent trades with the market maker in random order, using current market price for their trade.
+        # Each agent computes optimal trade size, scaled by trade_fraction.
         order = (
             self.rng.permutation(len(self.agents))
             if self.shuffle_agents
@@ -325,7 +346,7 @@ class SimulationEngine:
         volume = 0.0
         for idx in order:
             agent = self.agents[idx]
-            q_t = self.market.get_price()
+            q_t = self.market.get_price()  # Always use up-to-date price
             x_star = agent.get_optimal_trade(q_t) * self.trade_fraction
             if abs(x_star) < self.min_trade_size:
                 continue
@@ -335,7 +356,8 @@ class SimulationEngine:
         return volume
 
     def _run_cda_round(self) -> float:
-        # cancel stale quotes first, then resubmit based on updated belief
+        # Each agent cancels stale orders, computes a limit/market order, and submits.
+        # Market matches orders and returns trades; portfolios are updated for all trades.
         order = (
             self.rng.permutation(len(self.agents))
             if self.shuffle_agents
@@ -344,7 +366,8 @@ class SimulationEngine:
         volume = 0.0
         for idx in order:
             agent = self.agents[idx]
-            self.market.cancel_agent_orders(agent.id)
+            self.market.cancel_agent_orders(agent.id)  # Ensure no stale orders per round
+
             ref = self.market.reference_price()
             order_spec = agent.build_order(
                 reference_price=ref,
@@ -356,8 +379,9 @@ class SimulationEngine:
                 min_trade_size=self.min_trade_size,
             )
             if order_spec is None:
-                continue
+                continue  # Agent isn't trading this round
 
+            # Differentiate between market and limit order submission
             if order_spec["type"] == "market":
                 result = self.market.submit_market_order(
                     agent_id=agent.id,
@@ -372,6 +396,7 @@ class SimulationEngine:
                     limit_price=order_spec["limit_price"],
                 )
 
+            # Update portfolios for all matched trades resulting from this submission
             for trade in result["trades"]:
                 qty = trade.quantity
                 notional = trade.price * qty
@@ -379,5 +404,5 @@ class SimulationEngine:
                 seller = self.agents_by_id[trade.seller_id]
                 buyer.update_portfolio(trade_shares=qty, trade_cost=notional)
                 seller.update_portfolio(trade_shares=-qty, trade_cost=-notional)
-                volume += qty
+                volume += qty  # Only matched trades count as volume
         return volume
