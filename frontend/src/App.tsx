@@ -35,6 +35,7 @@ type SimComment = {
   agent_id: number;
   belief: number;
   text: string;
+  source?: "llm" | "template";
 };
 
 type BeliefShiftEvent = {
@@ -91,11 +92,20 @@ type Settlement = {
   losers: SettlementRow[];
 };
 
+type CommentSampling = {
+  probability_per_agent_per_round: number;
+  llm_budget_initial?: number;
+  llm_budget_remaining?: number;
+  max_comments_per_event?: number | null;
+  comments_returned?: number;
+  comments_so_far?: number;
+};
+
 type SimulateResponse = {
   event_name: string;
   metrics: SimMetrics;
   comments: SimComment[];
-  comment_sampling?: { probability_per_agent_per_round: number };
+  comment_sampling?: CommentSampling;
   state: SimState;
   settlement?: Settlement;
 };
@@ -108,9 +118,122 @@ type SessionSnapshot = {
   state: SimState;
   metrics: SimMetrics;
   comments: SimComment[];
+  comment_sampling?: CommentSampling;
   rounds_advanced?: number;
   shift_event?: BeliefShiftEvent;
 };
+
+type StreamTick = {
+  type: "tick";
+  state: SimState;
+  mean_initial_belief: number;
+  append: {
+    price: number;
+    mean_belief: number;
+    error: number;
+    trade_volume: number;
+  };
+  new_comments: SimComment[];
+  comment_sampling: CommentSampling;
+  append_best_bid?: number | null;
+  append_best_ask?: number | null;
+};
+
+function mergeStreamTick(
+  prev: SimulateResponse | null,
+  tick: StreamTick,
+  form: SimulatePayload,
+): SimulateResponse {
+  const { append } = tick;
+  const price_series = [...(prev?.metrics.price_series ?? []), append.price];
+  const mean_belief_series = [...(prev?.metrics.mean_belief_series ?? []), append.mean_belief];
+  const error_series = [...(prev?.metrics.error_series ?? []), append.error];
+  const trade_volume = [...(prev?.metrics.trade_volume ?? []), append.trade_volume];
+  let best_bid_series = prev?.metrics.best_bid_series;
+  let best_ask_series = prev?.metrics.best_ask_series;
+  if (tick.append_best_bid !== undefined) {
+    best_bid_series = [...(best_bid_series ?? []), tick.append_best_bid];
+  }
+  if (tick.append_best_ask !== undefined) {
+    best_ask_series = [...(best_ask_series ?? []), tick.append_best_ask];
+  }
+  const metrics: SimMetrics = {
+    total_rounds: tick.state.round,
+    price_series,
+    mean_belief_series,
+    error_series,
+    trade_volume,
+    mean_initial_belief: tick.mean_initial_belief,
+    final_price: append.price,
+    final_error: append.error,
+  };
+  if (best_bid_series != null) metrics.best_bid_series = best_bid_series;
+  if (best_ask_series != null) metrics.best_ask_series = best_ask_series;
+  return {
+    event_name: form.event_name,
+    metrics,
+    state: tick.state,
+    comments: [...(prev?.comments ?? []), ...tick.new_comments],
+    comment_sampling: tick.comment_sampling,
+  };
+}
+
+function ResultsSkeleton({
+  eventName,
+  mechanism,
+  groundTruth,
+}: {
+  eventName: string;
+  mechanism: string;
+  groundTruth: number;
+}) {
+  return (
+    <>
+      <div className="panel skeleton-edge" style={{ marginBottom: "1.1rem" }}>
+        <div className="skeleton-title" />
+        <div className="skeleton-line skeleton-line-md" style={{ marginTop: "0.5rem" }} />
+        <p className="sub" style={{ margin: "0.65rem 0 0", color: "var(--accent)", fontWeight: 600 }}>
+          Running simulation…
+        </p>
+      </div>
+      <div className="two-col">
+        <div className="panel skeleton-edge">
+          <div className="skeleton-h2" />
+          <div className="skeleton-line skeleton-line-long" />
+          <div className="chart-wrap chart-skeleton-wrap">
+            <div className="chart-skeleton" />
+            <p className="skeleton-status">Charts stream in round by round</p>
+          </div>
+        </div>
+        <div className="panel skeleton-edge">
+          <div className="skeleton-h2" />
+          <div className="skeleton-line skeleton-line-long" />
+          <div style={{ marginTop: "0.75rem" }}>
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className="skeleton-comment-row">
+                <div className="skeleton-comment-meta" />
+                <div className={`skeleton-comment-body ${i % 2 ? "short" : ""}`} />
+              </div>
+            ))}
+          </div>
+          <p className="sub" style={{ margin: "0.65rem 0 0", fontSize: "0.82rem" }}>
+            Comments appear as agents &quot;speak&quot;
+          </p>
+        </div>
+      </div>
+      <div className="panel skeleton-edge">
+        <div className="skeleton-h2" style={{ width: "42%" }} />
+        <div className="skeleton-line skeleton-line-long" />
+        <div className="chart-wrap chart-skeleton-wrap">
+          <div className="chart-skeleton" />
+        </div>
+      </div>
+      <p className="sub" style={{ margin: "-0.35rem 0 0", fontSize: "0.82rem", color: "var(--muted)" }}>
+        {eventName} · {(groundTruth * 100).toFixed(0)}% truth · {mechanism.toUpperCase()}
+      </p>
+    </>
+  );
+}
 
 const defaultPayload: SimulatePayload = {
   event_name: "Will the launch ship by Friday?",
@@ -136,7 +259,8 @@ function snapshotToResult(snapshot: SessionSnapshot, eventName: string): Simulat
     metrics: snapshot.metrics,
     comments: snapshot.comments,
     state: snapshot.state,
-    comment_sampling: { probability_per_agent_per_round: COMMENT_PROB },
+    comment_sampling:
+      snapshot.comment_sampling ?? { probability_per_agent_per_round: COMMENT_PROB },
   };
 }
 
@@ -197,6 +321,8 @@ export default function App() {
   const [shockAgentIds, setShockAgentIds] = useState("");
   const [shiftNotice, setShiftNotice] = useState<string | null>(null);
   const [targetRounds, setTargetRounds] = useState(0);
+  /** After a streamed run, keep charts instant (skip end-of-run reveal animation). */
+  const [streamChartLock, setStreamChartLock] = useState(false);
 
   const busy = loading || sessionBusy;
 
@@ -204,6 +330,11 @@ export default function App() {
     () => (result ? buildChartRows(result.metrics) : []),
     [result],
   );
+
+  const chartLive =
+    interactiveMode ||
+    streamChartLock ||
+    (Boolean(loading) && Boolean(result));
 
   /** 0 → 1 over CHART_REVEAL_MS so both charts draw left-to-right in sync (skipped in interactive mode) */
   const [chartReveal01, setChartReveal01] = useState(0);
@@ -213,7 +344,7 @@ export default function App() {
       setChartReveal01(0);
       return;
     }
-    if (interactiveMode) {
+    if (chartLive) {
       setChartReveal01(1);
       return;
     }
@@ -232,15 +363,15 @@ export default function App() {
       cancelled = true;
       cancelAnimationFrame(raf);
     };
-  }, [chartData, interactiveMode]);
+  }, [chartData, chartLive]);
 
   const animatedChartData = useMemo(() => {
     const n = chartData.length;
     if (n === 0) return [];
-    if (interactiveMode) return chartData;
+    if (chartLive) return chartData;
     const count = Math.max(1, Math.ceil(chartReveal01 * n));
     return chartData.slice(0, count);
-  }, [chartData, chartReveal01, interactiveMode]);
+  }, [chartData, chartReveal01, chartLive]);
 
   const roundDomainMax = Math.max(1, chartData.length);
 
@@ -265,21 +396,70 @@ export default function App() {
   async function runSim() {
     setLoading(true);
     setError(null);
-    try {
+    setResult(null);
+    setStreamChartLock(false);
+    const body = JSON.stringify(form);
+
+    async function fetchSimulateJson(): Promise<SimulateResponse> {
       const res = await fetch("/api/simulate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body,
       });
       if (!res.ok) {
         const t = await res.text();
         throw new Error(t || `HTTP ${res.status}`);
       }
-      const data = (await res.json()) as SimulateResponse;
-      setResult(data);
+      return (await res.json()) as SimulateResponse;
+    }
+
+    try {
+      const res = await fetch("/api/simulate/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `HTTP ${res.status}`);
+      }
+      if (!res.body) {
+        const data = await fetchSimulateJson();
+        setResult(data);
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const msg = JSON.parse(trimmed) as StreamTick | (SimulateResponse & { type: string });
+          if (msg.type === "tick") {
+            setResult((prev) => mergeStreamTick(prev, msg as StreamTick, form));
+          } else if (msg.type === "done") {
+            const { type: _t, ...rest } = msg as SimulateResponse & { type: "done" };
+            setResult(rest);
+            setStreamChartLock(true);
+          }
+        }
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setResult(null);
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      try {
+        const data = await fetchSimulateJson();
+        setResult(data);
+        setError(null);
+      } catch {
+        setResult(null);
+      }
     } finally {
       setLoading(false);
     }
@@ -691,7 +871,8 @@ export default function App() {
         {error ? <p className="error">{error}</p> : null}
       </div>
 
-      {result ? (
+      {result || (loading && !interactiveMode) ? (
+        result ? (
         <>
           <div className="panel" style={{ marginBottom: "1.1rem" }}>
             <strong style={{ fontSize: "1.15rem", display: "block", marginBottom: "0.35rem" }}>
@@ -762,11 +943,17 @@ export default function App() {
             <div className="panel">
               <strong>Agent comments</strong>
               <p className="sub" style={{ marginBottom: "0.5rem" }}>
-                Filler from beliefs (LLM later). Each agent only rarely comments in a given round
-                {result.comment_sampling != null
-                  ? ` (~${(result.comment_sampling.probability_per_agent_per_round * 100).toFixed(1)}% chance)`
-                  : ""}
-                , but with many agents and rounds you still get a healthy sample.
+                Short lines from random traders about your event
+                {typeof result.comment_sampling?.max_comments_per_event === "number"
+                  ? ` (max ${result.comment_sampling.max_comments_per_event})`
+                  : result.comment_sampling?.max_comments_per_event === null
+                    ? " (no cap)"
+                    : ""}
+                . <strong>LLM</strong> = written by a local model via{" "}
+                <a href="https://ollama.com" target="_blank" rel="noreferrer">
+                  Ollama
+                </a>
+                ; <strong>template</strong> = preset text if Ollama isn’t running or slots are used up.
               </p>
               <ul className="comments-list">
                 {commentsSorted.map((c, i) => (
@@ -778,6 +965,7 @@ export default function App() {
                         : c.belief < 0.5
                           ? " · leans No"
                           : " · even"}
+                      {c.source === "llm" ? " · LLM" : c.source === "template" ? " · template" : ""}
                     </div>
                     {c.text}
                   </li>
@@ -927,6 +1115,13 @@ export default function App() {
             </div>
           ) : null}
         </>
+        ) : (
+          <ResultsSkeleton
+            eventName={form.event_name}
+            mechanism={form.mechanism}
+            groundTruth={form.ground_truth}
+          />
+        )
       ) : null}
     </>
   );
