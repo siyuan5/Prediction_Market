@@ -37,6 +37,27 @@ type SimComment = {
   text: string;
 };
 
+type BeliefShiftEvent = {
+  round: number;
+  n_agents_shifted: number;
+  agent_ids: number[];
+  new_belief: number | null;
+  delta: number | null;
+  before_mean: number;
+  after_mean: number;
+};
+
+type SimState = {
+  round: number;
+  price: number;
+  error: number;
+  mean_belief: number;
+  ground_truth: number;
+  mechanism: string;
+  phase: number;
+  belief_shift_events?: BeliefShiftEvent[];
+};
+
 type SimMetrics = {
   total_rounds: number;
   price_series: number[];
@@ -75,8 +96,20 @@ type SimulateResponse = {
   metrics: SimMetrics;
   comments: SimComment[];
   comment_sampling?: { probability_per_agent_per_round: number };
-  state: { ground_truth: number; mechanism: string; phase: number };
+  state: SimState;
   settlement?: Settlement;
+};
+
+type SessionSnapshot = {
+  session_id: string;
+  target_rounds: number;
+  round: number;
+  done: boolean;
+  state: SimState;
+  metrics: SimMetrics;
+  comments: SimComment[];
+  rounds_advanced?: number;
+  shift_event?: BeliefShiftEvent;
 };
 
 const defaultPayload: SimulatePayload = {
@@ -95,6 +128,27 @@ const defaultPayload: SimulatePayload = {
 };
 
 const CHART_REVEAL_MS = 5000;
+const COMMENT_PROB = 0.01;
+
+function snapshotToResult(snapshot: SessionSnapshot, eventName: string): SimulateResponse {
+  return {
+    event_name: eventName,
+    metrics: snapshot.metrics,
+    comments: snapshot.comments,
+    state: snapshot.state,
+    comment_sampling: { probability_per_agent_per_round: COMMENT_PROB },
+  };
+}
+
+function parseAgentIds(raw: string): number[] | undefined {
+  const t = raw.trim();
+  if (!t) return undefined;
+  const ids = t
+    .split(/[\s,]+/)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && Number.isInteger(n) && n >= 0);
+  return ids.length ? ids : undefined;
+}
 
 const tooltipStyle = {
   background: "#ffffff",
@@ -134,18 +188,33 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SimulateResponse | null>(null);
+  const [interactiveMode, setInteractiveMode] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const [roundsPerStep, setRoundsPerStep] = useState(1);
+  const [shockMode, setShockMode] = useState<"new_belief" | "delta">("new_belief");
+  const [shockValue, setShockValue] = useState(0.65);
+  const [shockAgentIds, setShockAgentIds] = useState("");
+  const [shiftNotice, setShiftNotice] = useState<string | null>(null);
+  const [targetRounds, setTargetRounds] = useState(0);
+
+  const busy = loading || sessionBusy;
 
   const chartData = useMemo(
     () => (result ? buildChartRows(result.metrics) : []),
     [result],
   );
 
-  /** 0 → 1 over CHART_REVEAL_MS so both charts draw left-to-right in sync */
+  /** 0 → 1 over CHART_REVEAL_MS so both charts draw left-to-right in sync (skipped in interactive mode) */
   const [chartReveal01, setChartReveal01] = useState(0);
 
   useEffect(() => {
     if (chartData.length === 0) {
       setChartReveal01(0);
+      return;
+    }
+    if (interactiveMode) {
+      setChartReveal01(1);
       return;
     }
     setChartReveal01(0);
@@ -163,14 +232,15 @@ export default function App() {
       cancelled = true;
       cancelAnimationFrame(raf);
     };
-  }, [chartData]);
+  }, [chartData, interactiveMode]);
 
   const animatedChartData = useMemo(() => {
     const n = chartData.length;
     if (n === 0) return [];
+    if (interactiveMode) return chartData;
     const count = Math.max(1, Math.ceil(chartReveal01 * n));
     return chartData.slice(0, count);
-  }, [chartData, chartReveal01]);
+  }, [chartData, chartReveal01, interactiveMode]);
 
   const roundDomainMax = Math.max(1, chartData.length);
 
@@ -181,6 +251,16 @@ export default function App() {
       return a.agent_id - b.agent_id;
     });
   }, [result]);
+
+  useEffect(() => {
+    if (interactiveMode) return;
+    if (!sessionId) return;
+    const id = sessionId;
+    void fetch(`/api/session/${encodeURIComponent(id)}`, { method: "DELETE" });
+    setSessionId(null);
+    setResult(null);
+    setShiftNotice(null);
+  }, [interactiveMode, sessionId]);
 
   async function runSim() {
     setLoading(true);
@@ -205,6 +285,137 @@ export default function App() {
     }
   }
 
+  async function startInteractiveSession() {
+    setSessionBusy(true);
+    setError(null);
+    setShiftNotice(null);
+    try {
+      const res = await fetch("/api/session/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(form),
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `HTTP ${res.status}`);
+      }
+      const snap = (await res.json()) as SessionSnapshot;
+      setSessionId(snap.session_id);
+      setTargetRounds(snap.target_rounds);
+      setResult(snapshotToResult(snap, form.event_name));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setSessionId(null);
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  async function sessionStep() {
+    if (!sessionId) return;
+    setSessionBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/session/step", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, rounds: roundsPerStep }),
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `HTTP ${res.status}`);
+      }
+      const snap = (await res.json()) as SessionSnapshot;
+      setResult(snapshotToResult(snap, form.event_name));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  async function sessionShift() {
+    if (!sessionId) return;
+    setSessionBusy(true);
+    setError(null);
+    try {
+      const payload: Record<string, unknown> = {
+        session_id: sessionId,
+        agent_ids: parseAgentIds(shockAgentIds),
+      };
+      if (shockMode === "new_belief") {
+        const v = shockValue;
+        if (v < 0.01 || v > 0.99) {
+          throw new Error("Belief must be between 0.01 and 0.99");
+        }
+        payload.new_belief = v;
+      } else {
+        payload.delta = shockValue;
+      }
+      const res = await fetch("/api/session/shift", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `HTTP ${res.status}`);
+      }
+      const snap = (await res.json()) as SessionSnapshot;
+      setResult(snapshotToResult(snap, form.event_name));
+      if (snap.shift_event) {
+        const ev = snap.shift_event;
+        const kind = ev.new_belief != null ? `set to ${(ev.new_belief * 100).toFixed(0)}%` : `Δ ${ev.delta != null ? (ev.delta * 100).toFixed(1) : ""}%`;
+        setShiftNotice(`After round ${ev.round}: shifted ${ev.n_agents_shifted} agents (${kind}). Mean belief ${(ev.before_mean * 100).toFixed(1)}% → ${(ev.after_mean * 100).toFixed(1)}%.`);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  async function sessionFinish() {
+    if (!sessionId) return;
+    setSessionBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/session/finish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `HTTP ${res.status}`);
+      }
+      const data = (await res.json()) as SimulateResponse;
+      setSessionId(null);
+      setShiftNotice(null);
+      setResult(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  async function sessionCancel() {
+    if (!sessionId) return;
+    setSessionBusy(true);
+    setError(null);
+    try {
+      await fetch(`/api/session/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+      setSessionId(null);
+      setShiftNotice(null);
+      setResult(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
   function update<K extends keyof SimulatePayload>(key: K, value: SimulatePayload[K]) {
     setForm((f) => ({ ...f, [key]: value }));
   }
@@ -217,8 +428,9 @@ export default function App() {
       <h1>Prediction market playground</h1>
       <p className="sub">
         Pick LMSR or CDA, name your event, and set the true Yes chance. Agents see fresh signals each
-        round and update beliefs. The main chart is implied Yes% (No is 100% minus that); comments are
-        filler for now.
+        round and update beliefs. Use <strong>Interactive run</strong> to advance one or more rounds at
+        a time, inject belief shocks between steps, then finish for settlement. The main chart is
+        implied Yes% (No is 100% minus that); comments are filler for now.
       </p>
 
       <div className="panel">
@@ -343,10 +555,139 @@ export default function App() {
               disabled={form.belief_mode !== "fixed"}
             />
           </label>
-          <button className="primary" type="button" disabled={loading} onClick={runSim}>
-            {loading ? "Running…" : "Run simulation"}
-          </button>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={interactiveMode}
+              onChange={(e) => setInteractiveMode(e.target.checked)}
+              disabled={busy}
+            />
+            Interactive run (pause, shift beliefs, then finish)
+          </label>
+          {!interactiveMode ? (
+            <button className="primary" type="button" disabled={busy} onClick={runSim}>
+              {loading ? "Running…" : "Run simulation"}
+            </button>
+          ) : !sessionId ? (
+            <button className="primary" type="button" disabled={busy} onClick={startInteractiveSession}>
+              {sessionBusy ? "Starting…" : "Start interactive session"}
+            </button>
+          ) : null}
         </div>
+
+        {interactiveMode && sessionId ? (
+          <div className="interactive-dock">
+            <div className="interactive-dock-header">
+              <span className="interactive-dock-badge" aria-live="polite">
+                Live session
+              </span>
+              <span className="interactive-dock-round">
+                Round <strong>{result?.state.round ?? 0}</strong>
+                <span className="interactive-dock-round-total"> / {targetRounds}</span>
+                {result && result.state.round >= targetRounds ? (
+                  <span className="interactive-done-pill">Target reached</span>
+                ) : null}
+              </span>
+            </div>
+            <div
+              className="interactive-progress-track"
+              role="progressbar"
+              aria-valuenow={result?.state.round ?? 0}
+              aria-valuemin={0}
+              aria-valuemax={targetRounds || 1}
+            >
+              <div
+                className="interactive-progress-fill"
+                style={{
+                  width: `${targetRounds > 0 ? Math.min(100, ((result?.state.round ?? 0) / targetRounds) * 100) : 0}%`,
+                }}
+              />
+            </div>
+            <div className="interactive-toolbar">
+              <div className="interactive-toolbar-group">
+                <label className="interactive-compact-label">
+                  Rounds / step
+                  <input
+                    className="interactive-step-input"
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={roundsPerStep}
+                    onChange={(e) =>
+                      setRoundsPerStep(Math.max(1, Math.min(100, Number(e.target.value) || 1)))
+                    }
+                    disabled={busy}
+                  />
+                </label>
+                <button className="secondary" type="button" disabled={busy} onClick={sessionStep}>
+                  {sessionBusy ? "…" : "Step"}
+                </button>
+              </div>
+              <div className="interactive-toolbar-group">
+                <button className="primary" type="button" disabled={busy} onClick={sessionFinish}>
+                  Finish &amp; settle
+                </button>
+                <button className="danger-outline" type="button" disabled={busy} onClick={sessionCancel}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+            <div className="interactive-shock-block">
+              <span className="interactive-shock-title">Belief shock</span>
+              <p className="interactive-shock-hint">
+                Apply between steps. Leave agent IDs empty to affect everyone, or list IDs separated by
+                commas.
+              </p>
+              <div className="interactive-shock-grid">
+                <label>
+                  Mode
+                  <select
+                    value={shockMode}
+                    onChange={(e) => setShockMode(e.target.value as "new_belief" | "delta")}
+                    disabled={busy}
+                  >
+                    <option value="new_belief">Set belief to…</option>
+                    <option value="delta">Add Δ to belief</option>
+                  </select>
+                </label>
+                <label>
+                  {shockMode === "new_belief" ? "New belief (0–1)" : "Delta (e.g. +0.05)"}
+                  <input
+                    type="number"
+                    step={0.01}
+                    value={shockValue}
+                    onChange={(e) => setShockValue(Number(e.target.value))}
+                    disabled={busy}
+                  />
+                </label>
+                <label className="interactive-shock-span">
+                  Agent IDs (optional)
+                  <input
+                    type="text"
+                    placeholder="e.g. 0, 3, 12"
+                    value={shockAgentIds}
+                    onChange={(e) => setShockAgentIds(e.target.value)}
+                    disabled={busy}
+                  />
+                </label>
+                <button className="secondary" type="button" disabled={busy} onClick={sessionShift}>
+                  Apply shock
+                </button>
+              </div>
+              {shiftNotice ? <p className="interactive-shift-notice">{shiftNotice}</p> : null}
+              {result?.state.belief_shift_events && result.state.belief_shift_events.length > 0 ? (
+                <ul className="shift-log">
+                  {result.state.belief_shift_events.map((ev, i) => (
+                    <li key={i}>
+                      Round {ev.round}: {ev.n_agents_shifted} agents — mean{" "}
+                      {(ev.before_mean * 100).toFixed(1)}% → {(ev.after_mean * 100).toFixed(1)}%
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
         {error ? <p className="error">{error}</p> : null}
       </div>
 

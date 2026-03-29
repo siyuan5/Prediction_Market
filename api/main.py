@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import random
 import sys
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # src/ imports (same pattern as repo scripts)
 _ROOT = Path(__file__).resolve().parent.parent
@@ -96,15 +97,9 @@ def _belief_spec(body: SimulateRequest) -> BeliefSpec:
     return BeliefSpec(mode="bimodal")
 
 
-@app.get("/api/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.post("/api/simulate")
-def simulate(body: SimulateRequest) -> Dict[str, Any]:
+def _make_engine(body: SimulateRequest) -> SimulationEngine:
     rho_values = body.rho_values if body.rho_values else [0.5, 1.0, 2.0]
-    engine = SimulationEngine(
+    return SimulationEngine(
         mechanism=body.mechanism,
         phase=2,
         seed=body.seed,
@@ -117,29 +112,105 @@ def simulate(body: SimulateRequest) -> Dict[str, Any]:
         initial_price=body.initial_price,
     )
 
+
+def _append_round_comments(
+    engine: SimulationEngine,
+    comment_rng: random.Random,
+    comments: List[Dict[str, Any]],
+) -> None:
+    r = engine.round
+    for row in engine.get_agents():
+        if comment_rng.random() >= COMMENT_PROB_PER_AGENT_ROUND:
+            continue
+        comments.append(
+            {
+                "round": r,
+                "agent_id": row["agent_id"],
+                "belief": float(row["belief"]),
+                "yes_shares": float(row["shares"]),
+                "text": pick_filler_comment(
+                    float(row["belief"]),
+                    int(row["agent_id"]),
+                    int(r),
+                    comment_rng,
+                ),
+            }
+        )
+
+
+class _SessionData(TypedDict):
+    engine: SimulationEngine
+    config: SimulateRequest
+    comment_rng: random.Random
+    comments: List[Dict[str, Any]]
+
+
+_sessions: Dict[str, _SessionData] = {}
+
+
+class SessionStepRequest(BaseModel):
+    session_id: str
+    rounds: int = Field(1, ge=1, le=500)
+
+
+class SessionShiftRequest(BaseModel):
+    session_id: str
+    new_belief: Optional[float] = None
+    delta: Optional[float] = None
+    agent_ids: Optional[List[int]] = None
+    rho_filter: Optional[float] = None
+
+    @model_validator(mode="after")
+    def exactly_one_belief_op(self) -> SessionShiftRequest:
+        has_new = self.new_belief is not None
+        has_delta = self.delta is not None
+        if has_new == has_delta:
+            raise ValueError("Provide exactly one of new_belief or delta")
+        if has_new and not (0.01 <= float(self.new_belief) <= 0.99):
+            raise ValueError("new_belief must be between 0.01 and 0.99")
+        return self
+
+
+class SessionIdBody(BaseModel):
+    session_id: str
+
+
+def _get_session(session_id: str) -> _SessionData:
+    s = _sessions.get(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired session_id")
+    return s
+
+
+def _session_snapshot(data: _SessionData, *, target_rounds: int, session_id: str) -> Dict[str, Any]:
+    engine = data["engine"]
+    return {
+        "session_id": session_id,
+        "target_rounds": target_rounds,
+        "round": engine.round,
+        "done": engine.round >= target_rounds,
+        "state": engine.get_state(),
+        "metrics": engine.get_metrics(),
+        "comments": data["comments"],
+        "agents": engine.get_agents(),
+    }
+
+
+@app.get("/api/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/api/simulate")
+def simulate(body: SimulateRequest) -> Dict[str, Any]:
+    engine = _make_engine(body)
+
     comment_rng = random.Random(body.seed + 17)
     comments: List[Dict[str, Any]] = []
 
     for _ in range(body.n_rounds):
         engine.run(1)
-        r = engine.round
-        for row in engine.get_agents():
-            if comment_rng.random() >= COMMENT_PROB_PER_AGENT_ROUND:
-                continue
-            comments.append(
-                {
-                    "round": r,
-                    "agent_id": row["agent_id"],
-                    "belief": float(row["belief"]),
-                    "yes_shares": float(row["shares"]),
-                    "text": pick_filler_comment(
-                        float(row["belief"]),
-                        int(row["agent_id"]),
-                        int(r),
-                        comment_rng,
-                    ),
-                }
-            )
+        _append_round_comments(engine, comment_rng, comments)
 
     metrics = engine.get_metrics()
     agents_final = engine.get_agents()
@@ -165,6 +236,98 @@ def simulate(body: SimulateRequest) -> Dict[str, Any]:
             "config": body.model_dump(),
         }
     )
+
+
+@app.post("/api/session/start")
+def session_start(body: SimulateRequest) -> Dict[str, Any]:
+    session_id = str(uuid.uuid4())
+    engine = _make_engine(body)
+    data: _SessionData = {
+        "engine": engine,
+        "config": body,
+        "comment_rng": random.Random(body.seed + 17),
+        "comments": [],
+    }
+    _sessions[session_id] = data
+    return _jsonable(_session_snapshot(data, target_rounds=body.n_rounds, session_id=session_id))
+
+
+@app.post("/api/session/step")
+def session_step(body: SessionStepRequest) -> Dict[str, Any]:
+    data = _get_session(body.session_id)
+    engine = data["engine"]
+    cfg = data["config"]
+    remaining = max(0, cfg.n_rounds - engine.round)
+    if remaining == 0:
+        snap = _session_snapshot(data, target_rounds=cfg.n_rounds, session_id=body.session_id)
+        snap["rounds_advanced"] = 0
+        return _jsonable(snap)
+
+    to_run = min(body.rounds, remaining)
+    for _ in range(to_run):
+        engine.run(1)
+        _append_round_comments(engine, data["comment_rng"], data["comments"])
+
+    snap = _session_snapshot(data, target_rounds=cfg.n_rounds, session_id=body.session_id)
+    snap["rounds_advanced"] = to_run
+    return _jsonable(snap)
+
+
+@app.post("/api/session/shift")
+def session_shift(body: SessionShiftRequest) -> Dict[str, Any]:
+    data = _get_session(body.session_id)
+    engine = data["engine"]
+    cfg = data["config"]
+    kw: Dict[str, Any] = {}
+    if body.new_belief is not None:
+        kw["new_belief"] = body.new_belief
+    else:
+        kw["delta"] = body.delta
+    if body.agent_ids is not None:
+        kw["agent_ids"] = body.agent_ids
+    if body.rho_filter is not None:
+        kw["rho_filter"] = body.rho_filter
+    event = engine.shift_beliefs(**kw)
+    snap = _session_snapshot(data, target_rounds=cfg.n_rounds, session_id=body.session_id)
+    snap["shift_event"] = event
+    return _jsonable(snap)
+
+
+@app.post("/api/session/finish")
+def session_finish(body: SessionIdBody) -> Dict[str, Any]:
+    data = _get_session(body.session_id)
+    cfg = data["config"]
+    engine = data["engine"]
+    agents_final = engine.get_agents()
+    state = engine.get_state()
+    metrics = engine.get_metrics()
+    settlement = compute_settlement(
+        agents_final,
+        initial_cash=cfg.initial_cash,
+        ground_truth=cfg.ground_truth,
+        seed=cfg.seed,
+    )
+    del _sessions[body.session_id]
+    return _jsonable(
+        {
+            "event_name": cfg.event_name,
+            "metrics": metrics,
+            "agents_final": agents_final,
+            "state": state,
+            "settlement": settlement,
+            "comments": data["comments"],
+            "comment_sampling": {
+                "probability_per_agent_per_round": COMMENT_PROB_PER_AGENT_ROUND,
+            },
+            "config": cfg.model_dump(),
+        }
+    )
+
+
+@app.delete("/api/session/{session_id}")
+def session_delete(session_id: str) -> Dict[str, str]:
+    _sessions.pop(session_id, None)
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

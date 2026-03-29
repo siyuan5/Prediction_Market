@@ -158,6 +158,224 @@ button.primary:disabled {
   box-shadow: none;
 }
 
+button.secondary {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.55rem 1.1rem;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 0.88rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+button.secondary:hover:not(:disabled) {
+  border-color: #cbd5e1;
+  background: #e8ecf4;
+}
+
+button.secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.danger-outline {
+  background: transparent;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  padding: 0.55rem 1.1rem;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+
+button.danger-outline:hover:not(:disabled) {
+  background: #fef2f2;
+}
+
+/* Interactive session controls (nested in main form panel) */
+.interactive-dock {
+  margin-top: 1rem;
+  padding: 1rem 1.1rem;
+  border-radius: var(--radius-md);
+  border: 1px solid #bfdbfe;
+  background: linear-gradient(165deg, #f0f9ff 0%, #e0f2fe 55%, #f8fafc 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+
+.interactive-dock-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem 1rem;
+  margin-bottom: 0.65rem;
+}
+
+.interactive-dock-badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #0369a1;
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid #bae6fd;
+  padding: 0.28rem 0.65rem;
+  border-radius: 999px;
+}
+
+.interactive-dock-round {
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.interactive-dock-round strong {
+  color: var(--text);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.interactive-dock-round-total {
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.interactive-done-pill {
+  display: inline-block;
+  margin-left: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 650;
+  color: #166534;
+  background: #dcfce7;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  vertical-align: middle;
+}
+
+.interactive-progress-track {
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(3, 105, 161, 0.12);
+  overflow: hidden;
+  margin-bottom: 0.85rem;
+}
+
+.interactive-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #38bdf8, #0284c7);
+  transition: width 0.25s ease;
+}
+
+.interactive-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.85rem 1.25rem;
+  margin-bottom: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid rgba(3, 105, 161, 0.15);
+}
+
+.interactive-toolbar-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.5rem 0.65rem;
+}
+
+.interactive-toolbar-group button.primary {
+  grid-column: unset;
+  justify-self: unset;
+}
+
+.interactive-compact-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 0;
+}
+
+.interactive-step-input {
+  width: 4.25rem;
+  padding: 0.45rem 0.5rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.interactive-shock-block {
+  margin: 0;
+}
+
+.interactive-shock-title {
+  display: block;
+  font-size: 0.95rem;
+  font-weight: 650;
+  color: var(--text);
+  margin: 0 0 0.25rem;
+}
+
+.interactive-shock-hint {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin: 0 0 0.75rem;
+  max-width: 36rem;
+  line-height: 1.45;
+}
+
+.interactive-shock-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  gap: 0.75rem 1rem;
+  align-items: end;
+}
+
+.interactive-shock-grid .interactive-shock-span {
+  grid-column: 1 / -1;
+}
+
+.interactive-shift-notice {
+  font-size: 0.84rem;
+  color: #0369a1;
+  margin: 0.65rem 0 0;
+  padding: 0.5rem 0.65rem;
+  background: rgba(255, 255, 255, 0.65);
+  border-radius: var(--radius-sm);
+  border: 1px solid #bae6fd;
+  line-height: 1.4;
+}
+
+.shift-log {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin: 0.6rem 0 0;
+  padding: 0.5rem 0.65rem 0.5rem 1.25rem;
+  background: rgba(255, 255, 255, 0.5);
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(3, 105, 161, 0.1);
+}
+
+.shift-log li {
+  margin: 0.25rem 0;
+}
+
+label.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+  grid-column: 1 / -1;
+}
+
+label.checkbox-row input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
 .error {
   color: #b91c1c;
   font-size: 0.88rem;
