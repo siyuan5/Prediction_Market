@@ -1,4 +1,12 @@
-"""Smoke tests for `src.simulation_engine.SimulationEngine` (no production code changes)."""
+"""
+Smoke and contract tests for ``simulation_engine.SimulationEngine``.
+
+The engine is the shared driver for CLI scripts, FastAPI, and the UI: it wires
+agents to either LMSR or CDA, records time series, and supports mid-run belief
+shocks. These tests use small agent counts and fixed seeds so runs are fast and
+stable; ``shuffle_agents=False`` removes ordering randomness where we only care
+about aggregates.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +18,13 @@ from simulation_engine import SimulationEngine
 
 
 def test_lmsr_phase1_run_advances_round_and_price_in_unit_interval():
+    """
+    LMSR phase 1: beliefs are fixed; each round only trades.
+
+    After ``run(5)``, internal ``round`` and ``price_series`` length must match,
+    LMSR prices stay strictly inside (0,1), and ``get_state()`` error is the
+    absolute gap between price and ground truth (API contract for charts).
+    """
     eng = SimulationEngine(
         mechanism="lmsr",
         phase=1,
@@ -33,6 +48,13 @@ def test_lmsr_phase1_run_advances_round_and_price_in_unit_interval():
 
 
 def test_lmsr_phase2_emits_one_signal_per_round():
+    """
+    Phase 2: before trading each round, every agent sees one public signal.
+
+    Therefore ``signal_series`` should gain exactly one entry per round, and the
+    parallel ``mean_belief_series`` should stay the same length (one aggregate
+    belief snapshot after updates).
+    """
     n = 8
     eng = SimulationEngine(
         mechanism="lmsr",
@@ -50,6 +72,13 @@ def test_lmsr_phase2_emits_one_signal_per_round():
 
 
 def test_shift_beliefs_appends_event_and_changes_targets():
+    """
+    Mid-run belief shock API: ``shift_beliefs(new_belief=...)`` clips to (0.01,0.99).
+
+    We run one round first so ``round`` is non-zero, then shift everyone to 0.55.
+    The returned event should report six agents shifted and mean 0.55; the log
+    ``belief_shift_events`` gains one entry; all agents match the new belief.
+    """
     eng = SimulationEngine(
         mechanism="lmsr",
         phase=1,
@@ -67,6 +96,12 @@ def test_shift_beliefs_appends_event_and_changes_targets():
 
 
 def test_cda_smoke_bounded_prices_and_volume_nonnegative():
+    """
+    CDA path: ``ContinuousDoubleAuction`` reference prices and order-book stats.
+
+    Reference prices stay in the model’s traded range; volume is nonnegative;
+    best bid/ask history exists for each round (UI order-book strip).
+    """
     eng = SimulationEngine(
         mechanism="cda",
         phase=1,
@@ -84,6 +119,12 @@ def test_cda_smoke_bounded_prices_and_volume_nonnegative():
 
 
 def test_invalid_mechanism_raises():
+    """
+    Constructor validation: only ``lmsr`` and ``cda`` are supported.
+
+    A bad string should fail fast with ``ValueError`` so misconfigured API
+    requests or scripts do not silently fall through.
+    """
     try:
         SimulationEngine(mechanism="auction", phase=1, seed=1, n_agents=4)
     except ValueError as e:
@@ -93,6 +134,13 @@ def test_invalid_mechanism_raises():
 
 
 def test_get_agents_pnl_matches_mark_definition():
+    """
+    ``get_agents`` P&L matches mark-to-market at the current LMSR price.
+
+    For each agent, ``pnl`` should equal ``cash + shares * price - initial_cash``
+    where ``price`` is the engine’s current quote (same as ``get_state()['price']``).
+    This mirrors how the API exposes agent rows to the frontend.
+    """
     eng = SimulationEngine(
         mechanism="lmsr",
         phase=1,
