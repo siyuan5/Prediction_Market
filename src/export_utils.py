@@ -1,3 +1,10 @@
+"""
+Serialize simulation result dicts to JSON and CSV under ``outputs/``.
+
+Phase 1 vs phase 2 exporters align column sets with what ``run_*`` scripts put
+in the ``results`` dict (time series, agents, optional rho aggregates).
+"""
+
 import csv
 import json
 from pathlib import Path

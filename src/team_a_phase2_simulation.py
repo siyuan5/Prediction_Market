@@ -1,3 +1,10 @@
+"""
+Standalone Phase 2 LMSR simulation (legacy script path).
+
+Prefer `SimulationEngine(mechanism="lmsr", phase=2, ...)` for new code; this module
+keeps the original `run_phase2` API used by `run_team_a_phase2.py` and tests.
+"""
+
 import numpy as np
 
 from crra_agent import CRRAAgent

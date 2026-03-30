@@ -1,6 +1,8 @@
-# Agent belief initialization: BeliefSpec configures agent priors for simulation runs.
-# This design mirrors SignalSpec in phase2_utils.py for consistency.
-# Pass a BeliefSpec to SimulationEngine or call sample_beliefs() for standalone usage.
+"""
+Agent belief initialization: `BeliefSpec` configures priors (mirrors `SignalSpec` in shape).
+
+Pass a spec into `SimulationEngine` or call `sample_beliefs` directly for experiments.
+"""
 
 from __future__ import annotations
 

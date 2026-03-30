@@ -1,3 +1,9 @@
+/**
+ * Prediction market UI: configure a run, then either
+ *   (1) one-shot POST /api/simulate or streaming /api/simulate/stream, or
+ *   (2) session mode — start → step/pause → optional belief shift → finish + settlement.
+ * Charts consume `metrics` series; comments panel shows template or LLM lines from the API.
+ */
 import { useEffect, useMemo, useState } from "react";
 import {
   Area,

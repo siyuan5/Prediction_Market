@@ -1,3 +1,11 @@
+"""
+Continuous double auction (CDA) limit-order book for binary YES/NO shares.
+
+Price-time priority: each price level is a FIFO queue. Market orders walk the
+opposite book until filled or empty; unfilled limit remainder rests. Used with
+`TeamBCRRAAgent` when `SimulationEngine` is configured with mechanism='cda'.
+"""
+
 import bisect
 from collections import deque
 from dataclasses import dataclass

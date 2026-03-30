@@ -4,11 +4,13 @@ FastAPI server for the prediction-market sim. Run from repo root:
   pip install fastapi uvicorn numpy pydantic
   uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
 
-Optional: local LLM comments via Ollama (http://127.0.0.1:11434). Pull a model, e.g. `ollama pull llama3.2`.
-Env: COMMENT_USE_LLM=1 (default), OLLAMA_MODEL, OLLAMA_BASE_URL, OLLAMA_TIMEOUT, COMMENT_LLM_MAX,
-COMMENT_MAX_TOTAL (default 15 comments per event; 0 = unlimited).
+Endpoints fall into three groups:
+  * Stateless: ``POST /api/simulate`` runs ``n_rounds`` and returns metrics + settlement.
+  * Streaming: ``POST /api/simulate/stream`` emits one NDJSON line per round (UI live charts).
+  * Session: ``/api/session/*`` keeps a ``SimulationEngine`` in memory for pause/step/shift/finish.
 
-UI streaming: POST /api/simulate/stream returns NDJSON (tick per round, then done) so charts/comments can update incrementally.
+Optional: Ollama at http://127.0.0.1:11434 for LLM trader lines (``ollama pull <model>``).
+Env: COMMENT_USE_LLM, OLLAMA_*, COMMENT_LLM_MAX, COMMENT_MAX_TOTAL (cap comments per run).
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from simulation_engine import SimulationEngine  # noqa: E402
 
 from .llm_comments import generate_comment_text, llm_budget_initial
 
-# Low chance each agent speaks in a given round; capped per event by _comment_max_total().
+# Sparse synthetic chat: each (agent, round) gets a comment only with this probability.
 COMMENT_PROB_PER_AGENT_ROUND = 0.01
 
 
@@ -181,6 +183,7 @@ class _SessionData(TypedDict):
     llm_budget_initial: int
 
 
+# In-memory sessions (dev/demo); restart the server clears state.
 _sessions: Dict[str, _SessionData] = {}
 
 
@@ -244,6 +247,9 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+# --- Stateless full run: build engine, run all rounds, optional LLM comments, settle ---
+
+
 @app.post("/api/simulate")
 def simulate(body: SimulateRequest) -> Dict[str, Any]:
     engine = _make_engine(body)
@@ -292,6 +298,9 @@ def simulate(body: SimulateRequest) -> Dict[str, Any]:
             "config": body.model_dump(),
         }
     )
+
+
+# --- NDJSON stream: same economics as /simulate, one tick payload per round for the UI ---
 
 
 def _simulate_ndjson_chunks(body: SimulateRequest) -> Iterator[Dict[str, Any]]:
@@ -383,6 +392,9 @@ def simulate_stream(body: SimulateRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# --- Interactive session: step rounds, inject belief shocks, finish with settlement ---
 
 
 @app.post("/api/session/start")

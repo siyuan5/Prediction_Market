@@ -1,4 +1,9 @@
-# Signal and update utility functions for Phase 2 (public signals, agent Bayesian update).
+"""
+Phase 2 public signals and belief updates shared by LMSR and CDA agents.
+
+`generate_signal` draws S_t noisy-but-informative about `ground_truth`.
+`update_belief_*` maps (prior, signal) → new belief for the next trading round.
+"""
 
 from __future__ import annotations
 from dataclasses import dataclass

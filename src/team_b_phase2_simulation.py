@@ -1,3 +1,9 @@
+"""
+Phase 2 CDA simulation: signals, belief updates, then order-book trading each round.
+
+`SimulationEngine` wraps the same ideas; this file is the older explicit loop for Team B.
+"""
+
 import numpy as np
 
 # Support both relative and direct imports so module runs both as script and package

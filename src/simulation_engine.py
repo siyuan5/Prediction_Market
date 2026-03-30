@@ -1,13 +1,16 @@
-# SimulationEngine: manages stateful multi-round simulations for market mechanisms (LMSR and CDA, phase 1 and 2)
-# Features chunked runs, mid-run belief shocks, polling of agent/market state, and result metrics.
-# Usage Example:
-#   engine = SimulationEngine(mechanism="lmsr", phase=2, ground_truth=0.70)
-#   engine.run(30)                          # run 30 rounds
-#   engine.shift_beliefs(new_belief=0.9)    # shock all agents
-#   engine.run(20)                          # continue simulation
-#   engine.get_state()                      # get state snapshot
-#   engine.get_agents()                     # get agent data
-#   engine.get_metrics()                    # get metrics/history
+"""
+Stateful multi-round prediction-market simulations (LMSR or CDA; phase 1 or 2).
+
+Phase 1: fixed initial beliefs each round. Phase 2: public signal each round, then
+belief updates, then trading. Supports chunked `run(n)`, mid-run `shift_beliefs`,
+and snapshots for the FastAPI/UI (`get_state`, `get_agents`, `get_metrics`).
+
+Example:
+    engine = SimulationEngine(mechanism="lmsr", phase=2, ground_truth=0.70)
+    engine.run(30)
+    engine.shift_beliefs(new_belief=0.9)
+    engine.run(20)
+"""
 
 from __future__ import annotations
 
@@ -32,9 +35,15 @@ except ImportError:
 
 
 class SimulationEngine:
-    # mechanism: "lmsr" or "cda"
-    # phase 1 = static beliefs, phase 2 = agents get signals and update beliefs each round
-    # trade_fraction defaults to 1.0 in phase 1 (static beliefs), 0.20 in phase 2 (learning)
+    """
+    Orchestrates agents, the market (LMSR or CDA), and per-round history.
+
+    *mechanism*: ``"lmsr"`` uses ``CRRAAgent`` + ``LMSRMarketMaker``;
+    ``"cda"`` uses ``TeamBCRRAAgent`` + ``ContinuousDoubleAuction``.
+    *phase*: 1 = beliefs constant; 2 = signal + update then trade.
+    *trade_fraction*: scales optimal LMSR trade size (1.0 in phase 1, 0.20 default
+    in phase 2 to reduce oscillation).
+    """
 
     def __init__(
         self,

@@ -1,4 +1,8 @@
-"""Template filler comments for agents; replace with LLM calls later."""
+"""
+Template-only trader chat lines when Ollama is off, the budget is exhausted, or the LLM fails.
+
+Pools are chosen by coarse belief buckets so wording matches YES vs NO lean.
+"""
 
 from __future__ import annotations
 

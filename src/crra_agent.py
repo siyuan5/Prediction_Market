@@ -1,7 +1,16 @@
+"""
+CRRA (constant relative risk aversion) agent trading against the LMSR in Team A runs.
+
+Optimal trade size follows Sethi et al. (2024); `rho` controls risk aversion.
+Used with `LMSRMarketMaker` inside `SimulationEngine` (mechanism=lmsr).
+"""
+
 import numpy as np
 
 
 class CRRAAgent:
+    """Single agent: cash, YES shares, belief p ∈ (0,1), and risk aversion rho > 0."""
+
     def __init__(self, agent_id, initial_cash, belief_p, rho):
         self.id = agent_id
         self.cash = initial_cash  # y in the paper

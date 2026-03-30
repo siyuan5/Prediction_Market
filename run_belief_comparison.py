@@ -1,5 +1,13 @@
+"""
+Quick script: same LMSR Phase-1 run except `BeliefSpec` varies (Gaussian vs bimodal vs fixed).
+
+Compares final price and error vs ground truth for a course report / sanity check.
+Run from repo root: ``python run_belief_comparison.py``.
+"""
+
 import sys
-sys.path.insert(0, "src")  # Ensure src directory is on the Python path for module imports
+
+sys.path.insert(0, "src")  # Allow `from simulation_engine import ...` without installing a package
 
 from simulation_engine import SimulationEngine
 from belief_init import BeliefSpec

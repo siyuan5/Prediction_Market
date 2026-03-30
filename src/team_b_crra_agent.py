@@ -1,4 +1,13 @@
+"""
+Team B agent: same CRRA demand as Team A for pricing, plus `build_order` for the CDA.
+
+`hybrid` policy: post a limit near belief by default; use an aggressive market
+order when belief is far from the reference and (for buys) at/above best ask.
+"""
+
 class TeamBCRRAAgent:
+    """CRRA trader in a continuous double auction (order book), not the LMSR."""
+
     def __init__(self, agent_id, initial_cash, belief_p, rho):
         self.id = int(agent_id)
         self.cash = float(initial_cash)
