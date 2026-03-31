@@ -119,6 +119,19 @@ def _belief_spec(body: SimulateRequest) -> BeliefSpec:
     return BeliefSpec(mode="bimodal")
 
 
+def _snapshot_yes_shares(engine: SimulationEngine) -> Dict[int, float]:
+    """Pre–trade-round Yes share counts per agent (for buy/sell/hold labels on comments)."""
+    return {int(a.id): float(a.shares) for a in engine.agents}
+
+
+def _round_trade_flow(prev_shares: Dict[int, float], agent_id: int, shares_now: float) -> str:
+    prev = prev_shares.get(agent_id, shares_now)
+    delta = float(shares_now) - float(prev)
+    if abs(delta) < 1e-12:
+        return "hold"
+    return "buy_yes" if delta > 0 else "sell_yes"
+
+
 def _make_engine(body: SimulateRequest) -> SimulationEngine:
     rho_values = body.rho_values if body.rho_values else [0.5, 1.0, 2.0]
     return SimulationEngine(
@@ -143,6 +156,7 @@ def _append_round_comments(
     event_name: str,
     mechanism: str,
     llm_budget: Optional[List[int]],
+    prev_shares: Dict[int, float],
 ) -> None:
     r = engine.round
     price = float(engine.get_state()["price"])
@@ -152,13 +166,17 @@ def _append_round_comments(
             return
         if comment_rng.random() >= COMMENT_PROB_PER_AGENT_ROUND:
             continue
+        aid = int(row["agent_id"])
+        curr_sh = float(row["shares"])
+        trade_flow = _round_trade_flow(prev_shares, aid, curr_sh)
         text, source = generate_comment_text(
             event_name=event_name,
             mechanism=mechanism,
             belief=float(row["belief"]),
-            agent_id=int(row["agent_id"]),
+            agent_id=aid,
             round_num=int(r),
             market_yes_price=price,
+            trade_flow=trade_flow,
             rng=comment_rng,
             llm_budget=llm_budget,
         )
@@ -167,7 +185,8 @@ def _append_round_comments(
                 "round": r,
                 "agent_id": row["agent_id"],
                 "belief": float(row["belief"]),
-                "yes_shares": float(row["shares"]),
+                "yes_shares": curr_sh,
+                "trade_flow": trade_flow,
                 "text": text,
                 "source": source,
             }
@@ -260,6 +279,7 @@ def simulate(body: SimulateRequest) -> Dict[str, Any]:
     llm_budget = [llm_cap]
 
     for _ in range(body.n_rounds):
+        prev_shares = _snapshot_yes_shares(engine)
         engine.run(1)
         _append_round_comments(
             engine,
@@ -268,6 +288,7 @@ def simulate(body: SimulateRequest) -> Dict[str, Any]:
             event_name=body.event_name,
             mechanism=body.mechanism,
             llm_budget=llm_budget,
+            prev_shares=prev_shares,
         )
 
     metrics = engine.get_metrics()
@@ -313,6 +334,7 @@ def _simulate_ndjson_chunks(body: SimulateRequest) -> Iterator[Dict[str, Any]]:
 
     for _ in range(body.n_rounds):
         len_before = len(comments)
+        prev_shares = _snapshot_yes_shares(engine)
         engine.run(1)
         _append_round_comments(
             engine,
@@ -321,6 +343,7 @@ def _simulate_ndjson_chunks(body: SimulateRequest) -> Iterator[Dict[str, Any]]:
             event_name=body.event_name,
             mechanism=body.mechanism,
             llm_budget=llm_budget,
+            prev_shares=prev_shares,
         )
         new_comments = comments[len_before:]
         tick: Dict[str, Any] = {
@@ -427,6 +450,7 @@ def session_step(body: SessionStepRequest) -> Dict[str, Any]:
 
     to_run = min(body.rounds, remaining)
     for _ in range(to_run):
+        prev_shares = _snapshot_yes_shares(engine)
         engine.run(1)
         _append_round_comments(
             engine,
@@ -435,6 +459,7 @@ def session_step(body: SessionStepRequest) -> Dict[str, Any]:
             event_name=cfg.event_name,
             mechanism=cfg.mechanism,
             llm_budget=data["llm_budget"],
+            prev_shares=prev_shares,
         )
 
     snap = _session_snapshot(data, target_rounds=cfg.n_rounds, session_id=body.session_id)

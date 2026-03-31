@@ -103,6 +103,14 @@ def _sanitize_line(s: str) -> str:
     return t if t else ""
 
 
+def _trade_action_line(trade_flow: str) -> str:
+    if trade_flow == "buy_yes":
+        return "This round you net bought YES shares (longer Yes / shorter No)."
+    if trade_flow == "sell_yes":
+        return "This round you net sold YES shares (reducing Yes exposure or leaning No)."
+    return "This round you did not change your YES share position meaningfully (no trade or offsetting fills)."
+
+
 def _user_prompt(
     *,
     event_name: str,
@@ -111,6 +119,7 @@ def _user_prompt(
     agent_id: int,
     round_num: int,
     market_yes_price: float,
+    trade_flow: str,
 ) -> str:
     mech = "LMSR (automated market maker)" if mechanism == "lmsr" else "CDA (order book)"
     return (
@@ -118,8 +127,10 @@ def _user_prompt(
         f"Mechanism: {mech}.\n"
         f"You are trader #{agent_id}. Trading round {round_num}.\n"
         f"Your subjective probability the question resolves YES: {belief * 100:.1f}%.\n"
-        f"The market price (implied probability of YES) is about {market_yes_price * 100:.1f}%.\n\n"
+        f"The market price (implied probability of YES) is about {market_yes_price * 100:.1f}%.\n"
+        f"{_trade_action_line(trade_flow)}\n\n"
         "Write one casual comment about this specific question—your edge, doubt, or what you’re watching. "
+        "You may hint at buying or selling if it fits. "
         "Stay consistent with whether you lean YES or NO vs 50%."
     )
 
@@ -132,6 +143,7 @@ def generate_comment_text(
     agent_id: int,
     round_num: int,
     market_yes_price: float,
+    trade_flow: str,
     rng: random.Random,
     llm_budget: Optional[List[int]],
 ) -> Tuple[str, str]:
@@ -156,6 +168,7 @@ def generate_comment_text(
             agent_id=agent_id,
             round_num=round_num,
             market_yes_price=market_yes_price,
+            trade_flow=trade_flow,
         )
         out = _ollama_chat(prompt)
         if out:

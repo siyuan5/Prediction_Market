@@ -36,12 +36,15 @@ type SimulatePayload = {
   belief_fixed: number;
 };
 
+type TradeFlow = "buy_yes" | "sell_yes" | "hold";
+
 type SimComment = {
   round: number;
   agent_id: number;
   belief: number;
   text: string;
   source?: "llm" | "template";
+  trade_flow?: TradeFlow;
 };
 
 type BeliefShiftEvent = {
@@ -258,6 +261,13 @@ const defaultPayload: SimulatePayload = {
 
 const CHART_REVEAL_MS = 5000;
 const COMMENT_PROB = 0.01;
+
+function tradeFlowDescription(flow: TradeFlow | undefined): string {
+  if (flow === "buy_yes") return " · bought Yes";
+  if (flow === "sell_yes") return " · sold Yes";
+  if (flow === "hold") return " · no trade";
+  return "";
+}
 
 function snapshotToResult(snapshot: SessionSnapshot, eventName: string): SimulateResponse {
   return {
@@ -959,7 +969,9 @@ export default function App() {
                 <a href="https://ollama.com" target="_blank" rel="noreferrer">
                   Ollama
                 </a>
-                ; <strong>template</strong> = preset text if Ollama isn’t running or slots are used up.
+                ; <strong>template</strong> = preset text if Ollama isn’t running or slots are used up. Each
+                line notes net <strong>bought Yes</strong>, <strong>sold Yes</strong>, or <strong>no trade</strong>{" "}
+                that round.
               </p>
               <ul className="comments-list">
                 {commentsSorted.map((c, i) => (
@@ -971,6 +983,7 @@ export default function App() {
                         : c.belief < 0.5
                           ? " · leans No"
                           : " · even"}
+                      {tradeFlowDescription(c.trade_flow)}
                       {c.source === "llm" ? " · LLM" : c.source === "template" ? " · template" : ""}
                     </div>
                     {c.text}
