@@ -55,6 +55,7 @@ class SimulationEngine:
         n_agents: int = 50,
         initial_cash: float = 100.0,
         rho_values: Optional[List[float]] = None,
+        rho_distribution: str = "discrete",
         belief_spec: Optional[BeliefSpec] = None,
         # lmsr-specific param
         b: float = 100.0,
@@ -70,6 +71,13 @@ class SimulationEngine:
         belief_weight: float = 0.10,
         prior_strength: float = 20.0,
         obs_strength: float = 10.0,
+        # per-agent personality heterogeneity: draw from Uniform(lo, hi) if given
+        prior_strength_range: Optional[tuple] = None,
+        obs_strength_range: Optional[tuple] = None,
+        # naturalistic trading behaviour
+        signal_noise: float = 0.0,       # std-dev of private noise added to the public signal
+        execution_noise: float = 0.0,    # std-dev of multiplicative noise on trade size
+        participation_rate: float = 1.0, # probability each agent trades in any given round
         # execution
         trade_fraction: Optional[float] = None,
         min_trade_size: float = 1e-9,
@@ -94,6 +102,9 @@ class SimulationEngine:
         self.order_policy = order_policy
         self.limit_offset = limit_offset
         self.market_order_edge = market_order_edge
+        self.signal_noise = signal_noise
+        self.execution_noise = execution_noise
+        self.participation_rate = participation_rate
 
         # Use full trade in phase 1; restricted trade in phase 2 to damp instability
         if trade_fraction is None:
@@ -114,7 +125,27 @@ class SimulationEngine:
 
         # Agent setup: beliefs drawn from prior, risk preferences (rho) chosen randomly for heterogeneity
         beliefs = sample_beliefs(ground_truth, n_agents, belief_spec, self.rng)
-        rhos = self.rng.choice(rho_values, size=n_agents, replace=True)
+
+        # Rho: discrete pool (default) or lognormal for a continuous spread of risk aversion
+        if rho_distribution == "lognormal":
+            # log-mean=0 → median rho≈1; log-sigma=0.6 → ~10th pct 0.3, ~90th pct 3.3
+            rhos = np.clip(self.rng.lognormal(mean=0.0, sigma=0.6, size=n_agents), 0.1, 10.0)
+        else:
+            rhos = self.rng.choice(rho_values, size=n_agents, replace=True)
+
+        # Per-agent prior_strength: scalar or drawn from Uniform(lo, hi)
+        if prior_strength_range is not None:
+            lo, hi = float(prior_strength_range[0]), float(prior_strength_range[1])
+            agent_prior_strengths = self.rng.uniform(lo, hi, size=n_agents)
+        else:
+            agent_prior_strengths = np.full(n_agents, float(prior_strength))
+
+        # Per-agent obs_strength: scalar or drawn from Uniform(lo, hi)
+        if obs_strength_range is not None:
+            lo, hi = float(obs_strength_range[0]), float(obs_strength_range[1])
+            agent_obs_strengths = self.rng.uniform(lo, hi, size=n_agents)
+        else:
+            agent_obs_strengths = np.full(n_agents, float(obs_strength))
 
         if mechanism == "lmsr":
             self.agents = [
@@ -123,6 +154,9 @@ class SimulationEngine:
                     initial_cash=initial_cash,
                     belief_p=float(beliefs[i]),
                     rho=float(rhos[i]),
+                    prior_strength=float(agent_prior_strengths[i]),
+                    obs_strength=float(agent_obs_strengths[i]),
+                    participation_rate=float(participation_rate),
                 )
                 for i in range(n_agents)
             ]
@@ -133,6 +167,9 @@ class SimulationEngine:
                     initial_cash=initial_cash,
                     belief_p=float(beliefs[i]),
                     rho=float(rhos[i]),
+                    prior_strength=float(agent_prior_strengths[i]),
+                    obs_strength=float(agent_obs_strengths[i]),
+                    participation_rate=float(participation_rate),
                 )
                 for i in range(n_agents)
             ]
@@ -184,12 +221,19 @@ class SimulationEngine:
                 self.signal_series.append(signal_t)
                 seg_signals.append(signal_t)
                 for agent in self.agents:
+                    # Each agent receives the public signal plus optional private noise
+                    if self.signal_noise > 0.0:
+                        private_signal = float(np.clip(
+                            signal_t + self.rng.normal(0.0, self.signal_noise),
+                            0.01, 0.99,
+                        ))
+                    else:
+                        private_signal = signal_t
+                    # Use the agent's own prior/obs strength (set at initialisation)
                     agent.update_belief(
-                        signal_t,
+                        private_signal,
                         method=self.belief_update_method,
                         w=self.belief_weight,
-                        prior_strength=self.prior_strength,
-                        obs_strength=self.obs_strength,
                     )
 
             round_volume = self._run_round()
@@ -304,6 +348,9 @@ class SimulationEngine:
                 "cash": a.cash,
                 "shares": a.shares,
                 "pnl": a.cash + a.shares * price - self.initial_cash,
+                "prior_strength": a.prior_strength,
+                "obs_strength": a.obs_strength,
+                "participation_rate": a.participation_rate,
             }
             for a in self.agents
         ]
@@ -355,8 +402,14 @@ class SimulationEngine:
         volume = 0.0
         for idx in order:
             agent = self.agents[idx]
+            # Participation check: agent may sit out this round
+            if agent.participation_rate < 1.0 and self.rng.random() > agent.participation_rate:
+                continue
             q_t = self.market.get_price()  # Always use up-to-date price
             x_star = agent.get_optimal_trade(q_t) * self.trade_fraction
+            # Apply execution noise: small random multiplier simulates imprecise sizing
+            if self.execution_noise > 0.0:
+                x_star *= 1.0 + self.rng.normal(0.0, self.execution_noise)
             if abs(x_star) < self.min_trade_size:
                 continue
             trade_cost = self.market.calculate_trade_cost(x_star)
@@ -376,6 +429,9 @@ class SimulationEngine:
         for idx in order:
             agent = self.agents[idx]
             self.market.cancel_agent_orders(agent.id)  # Ensure no stale orders per round
+            # Participation check: agent may sit out this round
+            if agent.participation_rate < 1.0 and self.rng.random() > agent.participation_rate:
+                continue
 
             ref = self.market.reference_price()
             order_spec = agent.build_order(
@@ -389,6 +445,11 @@ class SimulationEngine:
             )
             if order_spec is None:
                 continue  # Agent isn't trading this round
+
+            # Apply execution noise: jitter the order quantity slightly
+            if self.execution_noise > 0.0 and order_spec["quantity"] > 0:
+                noisy_qty = order_spec["quantity"] * (1.0 + self.rng.normal(0.0, self.execution_noise))
+                order_spec = dict(order_spec, quantity=max(noisy_qty, self.min_trade_size))
 
             # Differentiate between market and limit order submission
             if order_spec["type"] == "market":

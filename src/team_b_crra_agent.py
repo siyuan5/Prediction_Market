@@ -8,12 +8,18 @@ order when belief is far from the reference and (for buys) at/above best ask.
 class TeamBCRRAAgent:
     """CRRA trader in a continuous double auction (order book), not the LMSR."""
 
-    def __init__(self, agent_id, initial_cash, belief_p, rho):
+    def __init__(self, agent_id, initial_cash, belief_p, rho, *,
+                 prior_strength=20.0, obs_strength=10.0, participation_rate=1.0):
         self.id = int(agent_id)
         self.cash = float(initial_cash)
         self.shares = 0.0
         self.belief = float(belief_p)
         self.rho = float(rho)
+        # Per-agent personality: stubbornness and signal sensitivity
+        self.prior_strength = prior_strength
+        self.obs_strength = obs_strength
+        # Probability this agent participates in any given round (1.0 = always)
+        self.participation_rate = participation_rate
 
     def get_optimal_trade(self, market_price):
         # Computes optimal risky asset trade for a CRRA agent at price `q`
@@ -123,20 +129,24 @@ class TeamBCRRAAgent:
         self.cash -= float(trade_cost)
         self.shares += float(trade_shares)
 
-    def update_belief(self, signal_s, *, method="beta", w=0.10, prior_strength=20.0, obs_strength=5.0):
+    def update_belief(self, signal_s, *, method="beta", w=0.10, prior_strength=None, obs_strength=None):
         # Bayesian or weighted belief update after observing a signal
         try:
             from .phase2_utils import update_belief_weighted, update_belief_beta
         except ImportError:
             from phase2_utils import update_belief_weighted, update_belief_beta
 
+        # Fall back to per-agent values when caller doesn't override
+        ps = self.prior_strength if prior_strength is None else float(prior_strength)
+        os_ = self.obs_strength if obs_strength is None else float(obs_strength)
+
         if method == "weighted":
             self.belief = update_belief_weighted(self.belief, float(signal_s), float(w))
         elif method == "beta":
             self.belief = update_belief_beta(
                 self.belief, float(signal_s),
-                prior_strength=float(prior_strength),
-                obs_strength=float(obs_strength),
+                prior_strength=float(ps),
+                obs_strength=float(os_),
             )
         else:
             raise ValueError(f"Unknown method={method!r}")
