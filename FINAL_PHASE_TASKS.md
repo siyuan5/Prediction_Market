@@ -468,11 +468,37 @@ Three experiments, each exporting CSV + JSON + chart:
 
 ---
 
-## Task 9 — System Integration Testing and Regression Validation
+## Task 9 — Unit Test Coverage for New Modules (Distributed)
 
-**Files:** `tests/test_integration.py`, `tests/test_market_db.py`, `tests/test_market_service.py`, `tests/test_autonomous_agent.py`, `tests/test_api_endpoints.py`, `tests/test_agent_runner.py`
+Each developer writes unit tests for the module they own as part of their task. This is not a separate assignment — it's a requirement baked into Tasks 1 through 7.
 
-**Done when:** all existing tests still pass after the refactor, new tests are written for every new module (database layer, market service, agent client, orchestrator), and end-to-end integration tests confirm the full stack (database → market service → API → autonomous agents → frontend) works together without breakage.
+**Per-task test files:**
+- Task 1 owner → `tests/test_market_db.py`
+- Task 2 owner → `tests/test_market_service.py`
+- Task 3 owner → `tests/test_api_endpoints.py`
+- Task 4 owner → `tests/test_autonomous_agent.py` + updates to `tests/test_crra_agent.py` after math extraction
+- Task 5 owner → `tests/test_personality.py`
+- Task 6 owner → `tests/test_agent_runner.py`
+- Task 7 owner → minimal smoke tests for new React components (optional but encouraged)
+
+**Done when:** every new module has unit tests covering normal cases and the error scenarios listed in the Error Handling Checklist.
+
+---
+
+## Task 10 — End-to-End Integration and Regression Validation
+
+**Files:** `tests/test_integration.py`
+
+**Owner:** Coordinator (separate from Task 9 which is distributed across devs).
+
+**Build:**
+- Full-stack integration tests that spin up the API server, create a market, run autonomous agents, verify state consistency end to end
+- Belief shock integration test: start market, run 10 seconds, inject shift, run another 10 seconds, assert price moved toward new belief mean
+- Concurrency stress test: 50 agents running for 30 seconds, assert no data corruption, no crashed threads, total trade count matches DB record count
+- Regression test sweep: run the full existing pytest suite after the refactor is complete and confirm nothing broke
+- Round-based vs autonomous parity check: same seed, same config, assert final prices are within tolerance of each other
+
+**Done when:** all existing Phase 1/2 tests still pass after the autonomous refactor, new integration tests cover the full stack (database → market service → API → autonomous agents → frontend), and a full test report is ready to include in the final deliverable write-up.
 
 ---
 
@@ -480,13 +506,13 @@ Three experiments, each exporting CSV + JSON + chart:
 
 ```
 Task 1 (DB) ────┐
-                ├──→ Task 2 (Service) ──→ Task 3 (API) ──┬──→ Task 6 (Runner) ──┬──→ Task 7 (Frontend) ──→ Task 8 (Benchmarks)
+                ├──→ Task 2 (Service) ──→ Task 3 (API) ──┬──→ Task 6 (Runner) ──┬──→ Task 7 (Frontend) ──→ Task 8 (Benchmarks) ──→ Task 10 (Integration)
                 │                                        │                      │
 Task 4 (Agent) ─┘                                        │                      │
                                                          │                      │
 Task 5 (Personality) ────────────────────────────────────┘                      │
                                                                                 │
-Task 9 (Testing) ← runs alongside every other task ─────────────────────────────┘
+Task 9 (Unit tests) ← baked into every task, owned by each dev ─────────────────┘
 ```
 
 **Parallel start candidates (day 1):**
@@ -503,12 +529,15 @@ Task 9 (Testing) ← runs alongside every other task ─────────
 
 ---
 
-## Assignment Suggestion (5 people)
+## Assignment Suggestion (6 people)
 
-| Person | Primary | Secondary |
+| Person | Primary | Test Responsibility (Task 9) |
 |---|---|---|
-| Backend Lead | Task 1 + Task 2 | Task 9 (DB/service tests) |
-| API Lead | Task 3 + Task 6 | Task 9 (API/runner tests) |
-| Agent Dev | Task 4 + Task 5 | Task 9 (agent tests) |
-| Frontend | Task 7 | UX polish |
-| Coordinator | Task 8 + Task 9 integration | Deliverable write-up, PM coordination |
+| Database Dev | Task 1 (DB layer) | Unit tests for DB layer |
+| Market Service Dev | Task 2 (market service) | Unit tests for market service |
+| API Lead | Task 3 (API) + Task 6 (Runner) | Unit tests for API + runner |
+| Agent Dev | Task 4 (Agent client) + Task 5 (Personality) | Unit tests for agent + personality |
+| Frontend | Task 7 | Component smoke tests |
+| Coordinator | Task 8 + Task 10 (Integration Testing) | Full-stack integration + regression |
+
+Task 9 (unit tests) is a shared requirement — each dev writes tests for the module they own. Task 10 (integration testing) is a standalone job owned by the Coordinator after the other tasks land.
