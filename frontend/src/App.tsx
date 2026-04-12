@@ -5,6 +5,7 @@
  * Charts consume `metrics` series; comments panel shows template or LLM lines from the API.
  */
 import { useEffect, useMemo, useState } from "react";
+import { AutonomousMarketPanel } from "./AutonomousMarketPanel";
 import {
   Area,
   AreaChart,
@@ -628,6 +629,8 @@ export default function App() {
         a time, inject belief shocks between steps, then finish for settlement. The main chart is
         implied Yes% (No is 100% minus that); comments are filler for now.
       </p>
+
+      <AutonomousMarketPanel />
 
       <div className="panel">
         <div className="form-grid">

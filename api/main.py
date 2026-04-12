@@ -4,10 +4,11 @@ FastAPI server for the prediction-market sim. Run from repo root:
   pip install fastapi uvicorn numpy pydantic
   uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
 
-Endpoints fall into three groups:
+Endpoints fall into four groups:
   * Stateless: ``POST /api/simulate`` runs ``n_rounds`` and returns metrics + settlement.
   * Streaming: ``POST /api/simulate/stream`` emits one NDJSON line per round (UI live charts).
   * Session: ``/api/session/*`` keeps a ``SimulationEngine`` in memory for pause/step/shift/finish.
+  * Persistent market: ``/api/market/*`` SQLite LMSR/CDA, trades, belief updates, autonomous threads.
 
 Optional: Ollama at http://127.0.0.1:11434 for LLM trader lines (``ollama pull <model>``).
 Env: COMMENT_USE_LLM, OLLAMA_*, COMMENT_LLM_MAX, COMMENT_MAX_TOTAL (cap comments per run).
@@ -40,6 +41,7 @@ from settlement import compute_settlement  # noqa: E402
 from simulation_engine import SimulationEngine  # noqa: E402
 
 from .llm_comments import generate_comment_text, llm_budget_initial
+from .market_routes import router as market_router
 
 # Sparse synthetic chat: each (agent, round) gets a comment only with this probability.
 COMMENT_PROB_PER_AGENT_ROUND = 0.01
@@ -107,6 +109,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Persistent LMSR/CDA market + autonomous agent threads (see ``api/market_routes.py``).
+app.include_router(market_router, prefix="/api")
 
 
 def _belief_spec(body: SimulateRequest) -> BeliefSpec:

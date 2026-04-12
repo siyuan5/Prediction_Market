@@ -8,6 +8,10 @@ dist/
 build/
 *.egg-info/
 outputs/
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
 node_modules/
 frontend/dist/
 .claude/

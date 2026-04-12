@@ -124,6 +124,31 @@ class MarketService:
     ) -> List[Dict[str, Any]]:
         return self._get_store().get_trades(market_id, agent_id, since_trade_id, limit)
 
+    def count_trades(self, market_id: int) -> int:
+        row = self._get_store().conn.execute(
+            "SELECT COUNT(*) AS c FROM trades WHERE market_id = ?", (market_id,)
+        ).fetchone()
+        return int(row["c"] if hasattr(row, "keys") else row[0])
+
+    def list_agents_for_market(self, market_id: int) -> List[Dict[str, Any]]:
+        """
+        Return one row per agent with a position in this market: id, name, cash,
+        yes_shares, belief, rho, personality (raw string from DB).
+        """
+        store = self._get_store()
+        rows = store.conn.execute(
+            """
+            SELECT a.id AS agent_id, a.name, a.cash,
+                   p.yes_shares, p.belief, p.rho, p.personality
+            FROM positions p
+            JOIN agents a ON a.id = p.agent_id
+            WHERE p.market_id = ?
+            ORDER BY a.id
+            """,
+            (market_id,),
+        ).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
     # ── Write operations (delegate with BEGIN IMMEDIATE) ──────────────
 
     def create_market(
