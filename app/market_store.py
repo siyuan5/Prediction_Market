@@ -12,15 +12,13 @@ Usage:
     store = MarketStore()                         # in-memory
     store = MarketStore("markets.db")             # file-backed
 
-    # LMSR market
-    mkt   = store.create_market("btc-100k", "BTC > $100k?", mechanism="lmsr", b=100.0)
-    agent = store.create_agent("alice", cash=1000.0)
+    mkt   = store.create_market("btc-100k", "BTC > $100k?",
+                                mechanism="lmsr", b=100.0, ground_truth=0.7)
+    agent = store.create_agent("alice", cash=1000.0,
+                               market_id=mkt["id"], belief=0.6, rho=1.0,
+                               personality="aggressive")
+    store.set_market_status(mkt["id"], "running")
     trade = store.submit_trade(agent["id"], mkt["id"], "buy_yes", shares=10.0)
-
-    # CDA market
-    mkt2  = store.create_market("eth-10k", "ETH > $10k?", mechanism="cda",
-                                tick_size=0.01, initial_price=0.5)
-    store.submit_limit_order(agent["id"], mkt2["id"], "buy", quantity=5.0, price=0.45)
 """
 
 from __future__ import annotations
@@ -30,26 +28,29 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+_VALID_MARKET_STATUSES = {"created", "open", "running", "stopped"}
+_TRADEABLE_STATUSES = {"open", "running"}
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS markets (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    slug            TEXT    UNIQUE NOT NULL,
-    title           TEXT    NOT NULL,
-    description     TEXT    NOT NULL DEFAULT '',
-    mechanism       TEXT    NOT NULL DEFAULT 'lmsr',
-    b               REAL,
-    inv_yes         REAL    NOT NULL DEFAULT 0.0,
-    inv_no          REAL    NOT NULL DEFAULT 0.0,
-    tick_size       REAL,
-    min_price       REAL    NOT NULL DEFAULT 0.001,
-    max_price       REAL    NOT NULL DEFAULT 0.999,
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug             TEXT    UNIQUE NOT NULL,
+    title            TEXT    NOT NULL,
+    description      TEXT    NOT NULL DEFAULT '',
+    mechanism        TEXT    NOT NULL DEFAULT 'lmsr',
+    ground_truth     REAL,
+    b                REAL,
+    inv_yes          REAL    NOT NULL DEFAULT 0.0,
+    inv_no           REAL    NOT NULL DEFAULT 0.0,
+    tick_size        REAL,
+    min_price        REAL    NOT NULL DEFAULT 0.001,
+    max_price        REAL    NOT NULL DEFAULT 0.999,
     last_trade_price REAL,
-    initial_price   REAL    NOT NULL DEFAULT 0.5,
-    status          TEXT    NOT NULL DEFAULT 'open',
-    resolution      TEXT,
-    created_at      TEXT    NOT NULL,
-    resolved_at     TEXT
+    initial_price    REAL    NOT NULL DEFAULT 0.5,
+    status           TEXT    NOT NULL DEFAULT 'created',
+    resolution       TEXT,
+    created_at       TEXT    NOT NULL,
+    resolved_at      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -60,10 +61,13 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 
 CREATE TABLE IF NOT EXISTS positions (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id   INTEGER NOT NULL REFERENCES agents(id),
-    market_id  INTEGER NOT NULL REFERENCES markets(id),
-    yes_shares REAL    NOT NULL DEFAULT 0.0,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id    INTEGER NOT NULL REFERENCES agents(id),
+    market_id   INTEGER NOT NULL REFERENCES markets(id),
+    yes_shares  REAL    NOT NULL DEFAULT 0.0,
+    belief      REAL,
+    rho         REAL,
+    personality TEXT,
     UNIQUE(agent_id, market_id)
 );
 
@@ -141,7 +145,6 @@ class MarketStore:
         ask = self._cda_best_ask(market_id)
         if bid is not None and ask is not None:
             return 0.5 * (bid + ask)
-
         mkt = self.conn.execute(
             "SELECT last_trade_price, initial_price FROM markets WHERE id = ?",
             (market_id,),
@@ -160,6 +163,13 @@ class MarketStore:
         ticks = round(clipped / tick_size)
         return ticks * tick_size
 
+    def _check_tradeable(self, mkt: sqlite3.Row) -> None:
+        if mkt["status"] not in _TRADEABLE_STATUSES:
+            raise ValueError(
+                f"Market {mkt['id']} has status {mkt['status']!r}; "
+                f"trading requires one of {_TRADEABLE_STATUSES}"
+            )
+
     # ── Markets ────────────────────────────────────────────────────────
 
     def create_market(
@@ -169,6 +179,7 @@ class MarketStore:
         *,
         mechanism: str = "lmsr",
         b: Optional[float] = None,
+        ground_truth: Optional[float] = None,
         description: str = "",
         tick_size: float = 0.0001,
         min_price: float = 0.001,
@@ -185,11 +196,11 @@ class MarketStore:
         now = datetime.now(timezone.utc).isoformat()
         cur = self.conn.execute(
             "INSERT INTO markets "
-            "(slug, title, description, mechanism, b, tick_size, min_price, max_price, "
-            " initial_price, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (slug, title, description, mechanism, b, tick_size, min_price, max_price,
-             initial_price, now),
+            "(slug, title, description, mechanism, ground_truth, b, tick_size, "
+            " min_price, max_price, initial_price, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (slug, title, description, mechanism, ground_truth, b, tick_size,
+             min_price, max_price, initial_price, now),
         )
         self.conn.commit()
         return self._market_row_to_dict(
@@ -222,8 +233,25 @@ class MarketStore:
             return self._lmsr_price(row["inv_yes"], row["inv_no"], row["b"])
         return self._cda_reference_price(market_id)
 
+    def set_market_status(self, market_id: int, status: str) -> Dict[str, Any]:
+        if status not in _VALID_MARKET_STATUSES:
+            raise ValueError(
+                f"status must be one of {_VALID_MARKET_STATUSES}, got {status!r}"
+            )
+        with self.conn:
+            mkt = self.conn.execute(
+                "SELECT * FROM markets WHERE id = ?", (market_id,)
+            ).fetchone()
+            if mkt is None:
+                raise ValueError(f"Market {market_id} not found")
+            if mkt["status"] == "resolved":
+                raise ValueError(f"Market {market_id} is resolved and cannot change status")
+            self.conn.execute(
+                "UPDATE markets SET status = ? WHERE id = ?", (status, market_id)
+            )
+        return self.get_market(market_id)
+
     def get_order_book(self, market_id: int) -> Dict[str, Any]:
-        """Return current open bids and asks for a CDA market."""
         bids = self.conn.execute(
             "SELECT price, SUM(remaining) as total_qty FROM orders "
             "WHERE market_id = ? AND side = 'buy' AND status = 'open' "
@@ -254,7 +282,6 @@ class MarketStore:
                 raise ValueError(f"Market {market_id} not found")
             if mkt["status"] == "resolved":
                 raise ValueError(f"Market {market_id} is already resolved")
-
             self.conn.execute(
                 "UPDATE orders SET status = 'cancelled' "
                 "WHERE market_id = ? AND status = 'open'",
@@ -283,22 +310,107 @@ class MarketStore:
 
     # ── Agents ─────────────────────────────────────────────────────────
 
-    def create_agent(self, name: str, cash: float) -> Dict[str, Any]:
+    def create_agent(
+        self,
+        name: str,
+        cash: float,
+        *,
+        market_id: Optional[int] = None,
+        belief: Optional[float] = None,
+        rho: Optional[float] = None,
+        personality: Optional[str] = None,
+    ) -> Dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
-        cur = self.conn.execute(
-            "INSERT INTO agents (name, cash, created_at) VALUES (?, ?, ?)",
-            (name, cash, now),
-        )
-        self.conn.commit()
-        return self._agent_row_to_dict(
-            self.conn.execute("SELECT * FROM agents WHERE id = ?", (cur.lastrowid,)).fetchone()
-        )
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO agents (name, cash, created_at) VALUES (?, ?, ?)",
+                (name, cash, now),
+            )
+            agent_id = cur.lastrowid
+            if market_id is not None:
+                self.conn.execute(
+                    "INSERT INTO positions "
+                    "(agent_id, market_id, yes_shares, belief, rho, personality) "
+                    "VALUES (?, ?, 0.0, ?, ?, ?)",
+                    (agent_id, market_id, belief, rho, personality),
+                )
+        row = self.conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        result = self._agent_row_to_dict(row)
+        if market_id is not None:
+            result.update({"belief": belief, "rho": rho, "personality": personality})
+        return result
 
-    def get_agent(self, agent_id: int) -> Dict[str, Any]:
+    def get_agent(self, agent_id: int, market_id: Optional[int] = None) -> Dict[str, Any]:
         row = self.conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
         if row is None:
             raise ValueError(f"Agent {agent_id} not found")
-        return self._agent_row_to_dict(row)
+        result = self._agent_row_to_dict(row)
+        if market_id is not None:
+            pos = self.conn.execute(
+                "SELECT * FROM positions WHERE agent_id = ? AND market_id = ?",
+                (agent_id, market_id),
+            ).fetchone()
+            if pos is not None:
+                result["yes_shares"] = pos["yes_shares"]
+                result["belief"] = pos["belief"]
+                result["rho"] = pos["rho"]
+                result["personality"] = pos["personality"]
+            else:
+                result["yes_shares"] = 0.0
+                result["belief"] = None
+                result["rho"] = None
+                result["personality"] = None
+        return result
+
+    def set_agent_belief(
+        self, market_id: int, agent_id: int, new_belief: float
+    ) -> float:
+        """Update agent's belief for a market. Returns the old belief."""
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT belief FROM positions WHERE agent_id = ? AND market_id = ?",
+                (agent_id, market_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"No position for agent {agent_id} in market {market_id}"
+                )
+            old_belief = row["belief"]
+            self.conn.execute(
+                "UPDATE positions SET belief = ? WHERE agent_id = ? AND market_id = ?",
+                (new_belief, agent_id, market_id),
+            )
+        return old_belief
+
+    def update_agent_portfolio(
+        self,
+        market_id: int,
+        agent_id: int,
+        cash_delta: float,
+        shares_delta: float,
+    ) -> Dict[str, Any]:
+        """Directly adjust an agent's cash and shares for a market."""
+        with self.conn:
+            agent = self.conn.execute(
+                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+            ).fetchone()
+            if agent is None:
+                raise ValueError(f"Agent {agent_id} not found")
+            self.conn.execute(
+                "UPDATE agents SET cash = cash + ? WHERE id = ?",
+                (cash_delta, agent_id),
+            )
+            self.conn.execute(
+                "INSERT INTO positions (agent_id, market_id, yes_shares) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(agent_id, market_id) "
+                "DO UPDATE SET yes_shares = yes_shares + ?",
+                (agent_id, market_id, shares_delta, shares_delta),
+            )
+        updated = self.get_agent(agent_id)
+        pos = self.get_position(agent_id, market_id)
+        updated["yes_shares"] = pos["yes_shares"]
+        return updated
 
     # ── Positions ──────────────────────────────────────────────────────
 
@@ -308,11 +420,17 @@ class MarketStore:
             (agent_id, market_id),
         ).fetchone()
         if row is None:
-            return {"agent_id": agent_id, "market_id": market_id, "yes_shares": 0.0}
+            return {
+                "agent_id": agent_id, "market_id": market_id,
+                "yes_shares": 0.0, "belief": None, "rho": None, "personality": None,
+            }
         return {
             "agent_id": row["agent_id"],
             "market_id": row["market_id"],
             "yes_shares": row["yes_shares"],
+            "belief": row["belief"],
+            "rho": row["rho"],
+            "personality": row["personality"],
         }
 
     # ── LMSR Trading ──────────────────────────────────────────────────
@@ -324,12 +442,6 @@ class MarketStore:
         side: str,
         shares: float,
     ) -> Dict[str, Any]:
-        """
-        Execute an LMSR trade atomically.
-
-        side: 'buy_yes' or 'sell_yes'
-        shares: positive quantity
-        """
         if side not in ("buy_yes", "sell_yes"):
             raise ValueError(f"side must be 'buy_yes' or 'sell_yes', got {side!r}")
         if shares <= 0:
@@ -341,8 +453,7 @@ class MarketStore:
             ).fetchone()
             if mkt is None:
                 raise ValueError(f"Market {market_id} not found")
-            if mkt["status"] != "open":
-                raise ValueError(f"Market {market_id} is {mkt['status']}, not open")
+            self._check_tradeable(mkt)
             if mkt["mechanism"] != "lmsr":
                 raise ValueError(
                     f"submit_trade is for LMSR markets; market {market_id} uses "
@@ -413,52 +524,23 @@ class MarketStore:
     # ── CDA Trading ────────────────────────────────────────────────────
 
     def submit_limit_order(
-        self,
-        agent_id: int,
-        market_id: int,
-        side: str,
-        quantity: float,
-        price: float,
+        self, agent_id: int, market_id: int, side: str,
+        quantity: float, price: float,
     ) -> Dict[str, Any]:
-        """
-        Submit a CDA limit order.  Crosses the spread if price-improving,
-        remainder rests on the book.
-
-        side: 'buy' or 'sell'
-        """
         return self._submit_cda_order(
-            agent_id=agent_id,
-            market_id=market_id,
-            side=side,
-            quantity=quantity,
-            limit_price=price,
-            is_market=False,
+            agent_id=agent_id, market_id=market_id, side=side,
+            quantity=quantity, limit_price=price, is_market=False,
         )
 
     def submit_market_order(
-        self,
-        agent_id: int,
-        market_id: int,
-        side: str,
-        quantity: float,
+        self, agent_id: int, market_id: int, side: str, quantity: float,
     ) -> Dict[str, Any]:
-        """
-        Submit a CDA market order.  Walks the opposite book until filled.
-        Unfilled quantity is *not* posted (unlike limit orders).
-
-        side: 'buy' or 'sell'
-        """
         return self._submit_cda_order(
-            agent_id=agent_id,
-            market_id=market_id,
-            side=side,
-            quantity=quantity,
-            limit_price=None,
-            is_market=True,
+            agent_id=agent_id, market_id=market_id, side=side,
+            quantity=quantity, limit_price=None, is_market=True,
         )
 
     def cancel_agent_orders(self, agent_id: int, market_id: int) -> int:
-        """Cancel all open orders for an agent in a market. Returns count cancelled."""
         cur = self.conn.execute(
             "UPDATE orders SET status = 'cancelled' "
             "WHERE agent_id = ? AND market_id = ? AND status = 'open'",
@@ -468,14 +550,8 @@ class MarketStore:
         return cur.rowcount
 
     def _submit_cda_order(
-        self,
-        *,
-        agent_id: int,
-        market_id: int,
-        side: str,
-        quantity: float,
-        limit_price: Optional[float],
-        is_market: bool,
+        self, *, agent_id: int, market_id: int, side: str,
+        quantity: float, limit_price: Optional[float], is_market: bool,
     ) -> Dict[str, Any]:
         if side not in ("buy", "sell"):
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
@@ -488,8 +564,7 @@ class MarketStore:
             ).fetchone()
             if mkt is None:
                 raise ValueError(f"Market {market_id} not found")
-            if mkt["status"] != "open":
-                raise ValueError(f"Market {market_id} is {mkt['status']}, not open")
+            self._check_tradeable(mkt)
             if mkt["mechanism"] != "cda":
                 raise ValueError(
                     f"CDA order methods are for CDA markets; market {market_id} uses "
@@ -504,7 +579,6 @@ class MarketStore:
 
             tick_size = mkt["tick_size"]
             min_p, max_p = mkt["min_price"], mkt["max_price"]
-
             if limit_price is not None:
                 limit_price = self._normalize_price(limit_price, tick_size, min_p, max_p)
 
@@ -529,75 +603,44 @@ class MarketStore:
                     ).fetchone()
                     if resting is None:
                         break
-
                     executed = min(remaining, resting["remaining"])
                     trade_price = resting["price"]
                     notional = trade_price * executed
-
                     buyer_cash = self.conn.execute(
                         "SELECT cash FROM agents WHERE id = ?", (agent_id,)
                     ).fetchone()["cash"]
                     if buyer_cash < notional:
                         break
-
+                    self.conn.execute("UPDATE agents SET cash = cash - ? WHERE id = ?", (notional, agent_id))
+                    self.conn.execute("UPDATE agents SET cash = cash + ? WHERE id = ?", (notional, resting["agent_id"]))
                     self.conn.execute(
-                        "UPDATE agents SET cash = cash - ? WHERE id = ?",
-                        (notional, agent_id),
-                    )
-                    self.conn.execute(
-                        "UPDATE agents SET cash = cash + ? WHERE id = ?",
-                        (notional, resting["agent_id"]),
-                    )
-                    self.conn.execute(
-                        "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(agent_id, market_id) "
-                        "DO UPDATE SET yes_shares = yes_shares + ?",
+                        "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
+                        "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
                         (agent_id, market_id, executed, executed),
                     )
                     self.conn.execute(
-                        "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(agent_id, market_id) "
-                        "DO UPDATE SET yes_shares = yes_shares + ?",
+                        "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
+                        "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
                         (resting["agent_id"], market_id, -executed, -executed),
                     )
-
                     new_rem = resting["remaining"] - executed
                     if new_rem <= eps:
-                        self.conn.execute(
-                            "UPDATE orders SET remaining = 0, status = 'filled' WHERE id = ?",
-                            (resting["id"],),
-                        )
+                        self.conn.execute("UPDATE orders SET remaining = 0, status = 'filled' WHERE id = ?", (resting["id"],))
                     else:
-                        self.conn.execute(
-                            "UPDATE orders SET remaining = ? WHERE id = ?",
-                            (new_rem, resting["id"]),
-                        )
-
-                    self.conn.execute(
-                        "UPDATE markets SET last_trade_price = ? WHERE id = ?",
-                        (trade_price, market_id),
-                    )
+                        self.conn.execute("UPDATE orders SET remaining = ? WHERE id = ?", (new_rem, resting["id"]))
+                    self.conn.execute("UPDATE markets SET last_trade_price = ? WHERE id = ?", (trade_price, market_id))
                     cur = self.conn.execute(
-                        "INSERT INTO trades "
-                        "(market_id, agent_id, side, shares, cost, "
-                        " price_before, price_after, created_at) "
+                        "INSERT INTO trades (market_id, agent_id, side, shares, cost, price_before, price_after, created_at) "
                         "VALUES (?, ?, 'buy', ?, ?, ?, ?, ?)",
-                        (market_id, agent_id, executed, notional,
-                         trade_price, trade_price, now),
+                        (market_id, agent_id, executed, notional, trade_price, trade_price, now),
                     )
                     matched_trades.append({
-                        "trade_id": cur.lastrowid,
-                        "buyer_id": agent_id,
-                        "seller_id": resting["agent_id"],
-                        "price": trade_price,
-                        "quantity": executed,
-                        "aggressor_side": "buy",
+                        "trade_id": cur.lastrowid, "buyer_id": agent_id,
+                        "seller_id": resting["agent_id"], "price": trade_price,
+                        "quantity": executed, "aggressor_side": "buy",
                     })
                     remaining -= executed
-
-                else:  # sell
+                else:
                     best = self._cda_best_bid(market_id)
                     if best is None:
                         break
@@ -611,97 +654,59 @@ class MarketStore:
                     ).fetchone()
                     if resting is None:
                         break
-
                     executed = min(remaining, resting["remaining"])
                     trade_price = resting["price"]
                     notional = trade_price * executed
-
                     resting_buyer_cash = self.conn.execute(
                         "SELECT cash FROM agents WHERE id = ?", (resting["agent_id"],)
                     ).fetchone()["cash"]
                     if resting_buyer_cash < notional:
-                        self.conn.execute(
-                            "UPDATE orders SET status = 'cancelled' WHERE id = ?",
-                            (resting["id"],),
-                        )
+                        self.conn.execute("UPDATE orders SET status = 'cancelled' WHERE id = ?", (resting["id"],))
                         continue
-
+                    self.conn.execute("UPDATE agents SET cash = cash + ? WHERE id = ?", (notional, agent_id))
+                    self.conn.execute("UPDATE agents SET cash = cash - ? WHERE id = ?", (notional, resting["agent_id"]))
                     self.conn.execute(
-                        "UPDATE agents SET cash = cash + ? WHERE id = ?",
-                        (notional, agent_id),
-                    )
-                    self.conn.execute(
-                        "UPDATE agents SET cash = cash - ? WHERE id = ?",
-                        (notional, resting["agent_id"]),
-                    )
-                    self.conn.execute(
-                        "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(agent_id, market_id) "
-                        "DO UPDATE SET yes_shares = yes_shares + ?",
+                        "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
+                        "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
                         (agent_id, market_id, -executed, -executed),
                     )
                     self.conn.execute(
-                        "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(agent_id, market_id) "
-                        "DO UPDATE SET yes_shares = yes_shares + ?",
+                        "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
+                        "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
                         (resting["agent_id"], market_id, executed, executed),
                     )
-
                     new_rem = resting["remaining"] - executed
                     if new_rem <= eps:
-                        self.conn.execute(
-                            "UPDATE orders SET remaining = 0, status = 'filled' WHERE id = ?",
-                            (resting["id"],),
-                        )
+                        self.conn.execute("UPDATE orders SET remaining = 0, status = 'filled' WHERE id = ?", (resting["id"],))
                     else:
-                        self.conn.execute(
-                            "UPDATE orders SET remaining = ? WHERE id = ?",
-                            (new_rem, resting["id"]),
-                        )
-
-                    self.conn.execute(
-                        "UPDATE markets SET last_trade_price = ? WHERE id = ?",
-                        (trade_price, market_id),
-                    )
+                        self.conn.execute("UPDATE orders SET remaining = ? WHERE id = ?", (new_rem, resting["id"]))
+                    self.conn.execute("UPDATE markets SET last_trade_price = ? WHERE id = ?", (trade_price, market_id))
                     cur = self.conn.execute(
-                        "INSERT INTO trades "
-                        "(market_id, agent_id, side, shares, cost, "
-                        " price_before, price_after, created_at) "
+                        "INSERT INTO trades (market_id, agent_id, side, shares, cost, price_before, price_after, created_at) "
                         "VALUES (?, ?, 'sell', ?, ?, ?, ?, ?)",
-                        (market_id, agent_id, executed, notional,
-                         trade_price, trade_price, now),
+                        (market_id, agent_id, executed, notional, trade_price, trade_price, now),
                     )
                     matched_trades.append({
-                        "trade_id": cur.lastrowid,
-                        "buyer_id": resting["agent_id"],
-                        "seller_id": agent_id,
-                        "price": trade_price,
-                        "quantity": executed,
-                        "aggressor_side": "sell",
+                        "trade_id": cur.lastrowid, "buyer_id": resting["agent_id"],
+                        "seller_id": agent_id, "price": trade_price,
+                        "quantity": executed, "aggressor_side": "sell",
                     })
                     remaining -= executed
 
             resting_order_id = None
             if not is_market and remaining > eps and limit_price is not None:
                 cur = self.conn.execute(
-                    "INSERT INTO orders "
-                    "(market_id, agent_id, side, price, quantity, remaining, created_at) "
+                    "INSERT INTO orders (market_id, agent_id, side, price, quantity, remaining, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (market_id, agent_id, side, limit_price, quantity, remaining, now),
                 )
                 resting_order_id = cur.lastrowid
-
             price_after = self._cda_reference_price(market_id)
 
         return {
-            "trades": matched_trades,
-            "filled_quantity": quantity - remaining,
-            "remaining_quantity": remaining,
-            "resting_order_id": resting_order_id,
-            "price_before": price_before,
-            "price_after": price_after,
+            "trades": matched_trades, "filled_quantity": quantity - remaining,
+            "remaining_quantity": remaining, "resting_order_id": resting_order_id,
+            "price_before": price_before, "price_after": price_after,
         }
 
     # ── Trade history ──────────────────────────────────────────────────
@@ -710,6 +715,7 @@ class MarketStore:
         self,
         market_id: Optional[int] = None,
         agent_id: Optional[int] = None,
+        since_trade_id: Optional[int] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
@@ -720,6 +726,9 @@ class MarketStore:
         if agent_id is not None:
             clauses.append("agent_id = ?")
             params.append(agent_id)
+        if since_trade_id is not None:
+            clauses.append("id > ?")
+            params.append(since_trade_id)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         rows = self.conn.execute(
@@ -737,6 +746,7 @@ class MarketStore:
             "title": row["title"],
             "description": row["description"],
             "mechanism": row["mechanism"],
+            "ground_truth": row["ground_truth"],
             "b": row["b"],
             "inv_yes": row["inv_yes"],
             "inv_no": row["inv_no"],

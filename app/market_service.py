@@ -1,36 +1,38 @@
 """
 Thread-safe market service with transactional trade execution for LMSR and CDA.
 
-Wraps a file-backed SQLite database with per-thread connections and
-``BEGIN IMMEDIATE`` transactions so concurrent callers serialize properly:
-the second thread blocks until the first commits, preventing stale-read
-races on inventory / cash.
-
-Key differences from MarketStore (single-thread, single-connection):
-  * ``threading.local()`` gives each thread its own ``sqlite3.Connection``.
-  * All writes use explicit ``BEGIN IMMEDIATE`` → ``COMMIT`` (manual
-    ``isolation_level = None``) so the RESERVED lock is held *before*
-    reading state, not after.
-  * ``PRAGMA busy_timeout`` lets a blocked thread wait rather than fail.
+Depends on MarketStore for schema/conversions, LMSRMarketMaker (team_a) for
+LMSR cost-function math, and ContinuousDoubleAuction (team_b) for CDA order
+matching.  Does not re-implement either pricing or matching logic.
 
 Usage:
     svc = MarketService("markets.db")
-
     mkt   = svc.create_market("btc-100k", "BTC > $100k?", mechanism="lmsr", b=100.0)
     alice = svc.create_agent("alice", cash=1000.0)
-
-    # safe to call from any thread
-    trade = svc.execute_trade(alice["id"], mkt["id"], "buy_yes", shares=5.0)
+    svc.set_market_status(mkt["id"], "running")
+    trade = svc.execute_lmsr_trade(mkt["id"], alice["id"], quantity=5.0)
 """
 
 from __future__ import annotations
 
 import sqlite3
+import sys
 import threading
+from collections import defaultdict, deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from market_store import MarketStore, _SCHEMA
+import numpy as np
+
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from team_a_market_logic import LMSRMarketMaker
+from team_b_market_logic import ContinuousDoubleAuction, Trade
+
+from market_store import MarketStore, _SCHEMA, _VALID_MARKET_STATUSES, _TRADEABLE_STATUSES
 
 _BUSY_TIMEOUT_MS = 5000
 
@@ -47,20 +49,15 @@ class MarketService:
         self._db_path = db_path
         self._uri = db_path.startswith("file:")
         self._local = threading.local()
-
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
 
     def _get_conn(self) -> sqlite3.Connection:
         conn: Optional[sqlite3.Connection] = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(
-                self._db_path,
-                uri=self._uri,
-                check_same_thread=False,
-            )
+            conn = sqlite3.connect(self._db_path, uri=self._uri, check_same_thread=False)
             conn.row_factory = sqlite3.Row
-            conn.isolation_level = None  # manual transaction control
+            conn.isolation_level = None
             conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
@@ -73,19 +70,21 @@ class MarketService:
             conn.close()
             self._local.conn = None
 
+    @staticmethod
+    def _check_tradeable(mkt: sqlite3.Row) -> None:
+        if mkt["status"] not in _TRADEABLE_STATUSES:
+            raise ValueError(
+                f"Market {mkt['id']} has status {mkt['status']!r}; "
+                f"trading requires one of {_TRADEABLE_STATUSES}"
+            )
+
     # ── Markets ────────────────────────────────────────────────────────
 
     def create_market(
-        self,
-        slug: str,
-        title: str,
-        *,
-        mechanism: str = "lmsr",
-        b: Optional[float] = None,
-        description: str = "",
-        tick_size: float = 0.0001,
-        min_price: float = 0.001,
-        max_price: float = 0.999,
+        self, slug: str, title: str, *, mechanism: str = "lmsr",
+        b: Optional[float] = None, ground_truth: Optional[float] = None,
+        description: str = "", tick_size: float = 0.0001,
+        min_price: float = 0.001, max_price: float = 0.999,
         initial_price: float = 0.5,
     ) -> Dict[str, Any]:
         if mechanism not in ("lmsr", "cda"):
@@ -94,22 +93,19 @@ class MarketService:
             raise ValueError("b (liquidity parameter) is required for LMSR markets")
         if mechanism == "lmsr" and b is not None and b <= 0:
             raise ValueError("b must be positive")
-
         conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("BEGIN IMMEDIATE")
         try:
             cur = conn.execute(
                 "INSERT INTO markets "
-                "(slug, title, description, mechanism, b, tick_size, min_price, max_price, "
-                " initial_price, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (slug, title, description, mechanism, b, tick_size, min_price, max_price,
-                 initial_price, now),
+                "(slug, title, description, mechanism, ground_truth, b, tick_size, "
+                " min_price, max_price, initial_price, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (slug, title, description, mechanism, ground_truth, b, tick_size,
+                 min_price, max_price, initial_price, now),
             )
-            row = conn.execute(
-                "SELECT * FROM markets WHERE id = ?", (cur.lastrowid,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM markets WHERE id = ?", (cur.lastrowid,)).fetchone()
             conn.execute("COMMIT")
             return MarketStore._market_row_to_dict(row)
         except Exception:
@@ -126,38 +122,41 @@ class MarketService:
     def list_markets(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = self._get_conn()
         if status is not None:
-            rows = conn.execute(
-                "SELECT * FROM markets WHERE status = ? ORDER BY id", (status,)
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM markets WHERE status = ? ORDER BY id", (status,)).fetchall()
         else:
             rows = conn.execute("SELECT * FROM markets ORDER BY id").fetchall()
         return [MarketStore._market_row_to_dict(r) for r in rows]
 
-    def get_price(self, market_id: int) -> float:
+    def set_market_status(self, market_id: int, status: str) -> Dict[str, Any]:
+        if status not in _VALID_MARKET_STATUSES:
+            raise ValueError(f"status must be one of {_VALID_MARKET_STATUSES}, got {status!r}")
         conn = self._get_conn()
-        row = conn.execute(
-            "SELECT mechanism, inv_yes, inv_no, b FROM markets WHERE id = ?",
-            (market_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"Market {market_id} not found")
-        if row["mechanism"] == "lmsr":
-            return MarketStore._lmsr_price(row["inv_yes"], row["inv_no"], row["b"])
-        return self._cda_reference_price(conn, market_id)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+            if mkt is None:
+                raise ValueError(f"Market {market_id} not found")
+            if mkt["status"] == "resolved":
+                raise ValueError(f"Market {market_id} is resolved and cannot change status")
+            conn.execute("UPDATE markets SET status = ? WHERE id = ?", (status, market_id))
+            row = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+            conn.execute("COMMIT")
+            return MarketStore._market_row_to_dict(row)
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def get_order_book(self, market_id: int) -> Dict[str, Any]:
         conn = self._get_conn()
         bids = conn.execute(
             "SELECT price, SUM(remaining) as total_qty FROM orders "
             "WHERE market_id = ? AND side = 'buy' AND status = 'open' "
-            "GROUP BY price ORDER BY price DESC",
-            (market_id,),
+            "GROUP BY price ORDER BY price DESC", (market_id,),
         ).fetchall()
         asks = conn.execute(
             "SELECT price, SUM(remaining) as total_qty FROM orders "
             "WHERE market_id = ? AND side = 'sell' AND status = 'open' "
-            "GROUP BY price ORDER BY price ASC",
-            (market_id,),
+            "GROUP BY price ORDER BY price ASC", (market_id,),
         ).fetchall()
         return {
             "bids": [{"price": r["price"], "quantity": r["total_qty"]} for r in bids],
@@ -180,61 +179,114 @@ class MarketService:
             if mkt["status"] == "resolved":
                 raise ValueError(f"Market {market_id} is already resolved")
             conn.execute(
-                "UPDATE orders SET status = 'cancelled' "
-                "WHERE market_id = ? AND status = 'open'",
+                "UPDATE orders SET status = 'cancelled' WHERE market_id = ? AND status = 'open'",
                 (market_id,),
             )
             conn.execute(
-                "UPDATE markets SET status = 'resolved', resolution = ?, resolved_at = ? "
-                "WHERE id = ?",
+                "UPDATE markets SET status = 'resolved', resolution = ?, resolved_at = ? WHERE id = ?",
                 (outcome, now, market_id),
             )
             positions = conn.execute(
-                "SELECT agent_id, yes_shares FROM positions WHERE market_id = ?",
-                (market_id,),
+                "SELECT agent_id, yes_shares FROM positions WHERE market_id = ?", (market_id,)
             ).fetchall()
             for pos in positions:
-                payout = pos["yes_shares"] * payoff
                 conn.execute(
                     "UPDATE agents SET cash = cash + ? WHERE id = ?",
-                    (payout, pos["agent_id"]),
+                    (pos["yes_shares"] * payoff, pos["agent_id"]),
                 )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        return {
+        return {"market_id": market_id, "outcome": outcome, "positions_settled": len(positions)}
+
+    # ── Pricing ────────────────────────────────────────────────────────
+
+    def get_price(self, market_id: int) -> float:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT mechanism, inv_yes, inv_no, b FROM markets WHERE id = ?", (market_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Market {market_id} not found")
+        if row["mechanism"] == "lmsr":
+            mm = LMSRMarketMaker(row["b"], [row["inv_yes"], row["inv_no"]])
+            return float(mm.get_price())
+        return self._cda_reference_price(conn, market_id)
+
+    def get_price_snapshot(self, market_id: int) -> Dict[str, Any]:
+        conn = self._get_conn()
+        mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+        if mkt is None:
+            raise ValueError(f"Market {market_id} not found")
+        result: Dict[str, Any] = {
             "market_id": market_id,
-            "outcome": outcome,
-            "positions_settled": len(positions),
+            "mechanism": mkt["mechanism"],
+            "status": mkt["status"],
         }
+        if mkt["mechanism"] == "lmsr":
+            mm = LMSRMarketMaker(mkt["b"], [mkt["inv_yes"], mkt["inv_no"]])
+            result["price"] = float(mm.get_price())
+            result["inv_yes"] = mkt["inv_yes"]
+            result["inv_no"] = mkt["inv_no"]
+            result["b"] = mkt["b"]
+        else:
+            result["price"] = self._cda_reference_price(conn, market_id)
+            result["best_bid"] = self._cda_best_bid(conn, market_id)
+            result["best_ask"] = self._cda_best_ask(conn, market_id)
+            result["last_trade_price"] = mkt["last_trade_price"]
+        return result
 
     # ── Agents ─────────────────────────────────────────────────────────
 
-    def create_agent(self, name: str, cash: float) -> Dict[str, Any]:
+    def create_agent(
+        self, name: str, cash: float, *, market_id: Optional[int] = None,
+        belief: Optional[float] = None, rho: Optional[float] = None,
+        personality: Optional[str] = None,
+    ) -> Dict[str, Any]:
         conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("BEGIN IMMEDIATE")
         try:
             cur = conn.execute(
-                "INSERT INTO agents (name, cash, created_at) VALUES (?, ?, ?)",
-                (name, cash, now),
+                "INSERT INTO agents (name, cash, created_at) VALUES (?, ?, ?)", (name, cash, now)
             )
-            row = conn.execute(
-                "SELECT * FROM agents WHERE id = ?", (cur.lastrowid,)
-            ).fetchone()
+            agent_id = cur.lastrowid
+            if market_id is not None:
+                conn.execute(
+                    "INSERT INTO positions (agent_id, market_id, yes_shares, belief, rho, personality) "
+                    "VALUES (?, ?, 0.0, ?, ?, ?)",
+                    (agent_id, market_id, belief, rho, personality),
+                )
+            row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
             conn.execute("COMMIT")
-            return MarketStore._agent_row_to_dict(row)
+            result = MarketStore._agent_row_to_dict(row)
+            if market_id is not None:
+                result.update({"belief": belief, "rho": rho, "personality": personality})
+            return result
         except Exception:
             conn.execute("ROLLBACK")
             raise
 
-    def get_agent(self, agent_id: int) -> Dict[str, Any]:
+    def get_agent(self, agent_id: int, market_id: Optional[int] = None) -> Dict[str, Any]:
         conn = self._get_conn()
         row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
         if row is None:
             raise ValueError(f"Agent {agent_id} not found")
-        return MarketStore._agent_row_to_dict(row)
+        result = MarketStore._agent_row_to_dict(row)
+        if market_id is not None:
+            pos = conn.execute(
+                "SELECT * FROM positions WHERE agent_id = ? AND market_id = ?",
+                (agent_id, market_id),
+            ).fetchone()
+            if pos is not None:
+                result.update({
+                    "yes_shares": pos["yes_shares"], "belief": pos["belief"],
+                    "rho": pos["rho"], "personality": pos["personality"],
+                })
+            else:
+                result.update({"yes_shares": 0.0, "belief": None, "rho": None, "personality": None})
+        return result
 
     def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
         conn = self._get_conn()
@@ -243,92 +295,134 @@ class MarketService:
             (agent_id, market_id),
         ).fetchone()
         if row is None:
-            return {"agent_id": agent_id, "market_id": market_id, "yes_shares": 0.0}
+            return {
+                "agent_id": agent_id, "market_id": market_id, "yes_shares": 0.0,
+                "belief": None, "rho": None, "personality": None,
+            }
         return {
-            "agent_id": row["agent_id"],
-            "market_id": row["market_id"],
-            "yes_shares": row["yes_shares"],
+            "agent_id": row["agent_id"], "market_id": row["market_id"],
+            "yes_shares": row["yes_shares"], "belief": row["belief"],
+            "rho": row["rho"], "personality": row["personality"],
         }
 
-    # ── LMSR Trading ──────────────────────────────────────────────────
-
-    def execute_trade(
-        self,
-        agent_id: int,
-        market_id: int,
-        side: str,
-        shares: float,
-    ) -> Dict[str, Any]:
-        """
-        Thread-safe LMSR trade execution.
-
-        Acquires a write lock (BEGIN IMMEDIATE) *before* reading inventory
-        so concurrent callers serialize: the second thread blocks until the
-        first commits, guaranteeing both see up-to-date state.
-        """
-        if side not in ("buy_yes", "sell_yes"):
-            raise ValueError(f"side must be 'buy_yes' or 'sell_yes', got {side!r}")
-        if shares <= 0:
-            raise ValueError("shares must be positive")
-
+    def set_agent_belief(self, market_id: int, agent_id: int, new_belief: float) -> float:
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            mkt = conn.execute(
-                "SELECT * FROM markets WHERE id = ?", (market_id,)
+            row = conn.execute(
+                "SELECT belief FROM positions WHERE agent_id = ? AND market_id = ?",
+                (agent_id, market_id),
             ).fetchone()
+            if row is None:
+                raise ValueError(f"No position for agent {agent_id} in market {market_id}")
+            old_belief = row["belief"]
+            conn.execute(
+                "UPDATE positions SET belief = ? WHERE agent_id = ? AND market_id = ?",
+                (new_belief, agent_id, market_id),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return old_belief
+
+    def update_agent_portfolio(
+        self, market_id: int, agent_id: int, cash_delta: float, shares_delta: float,
+    ) -> Dict[str, Any]:
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+            if agent is None:
+                raise ValueError(f"Agent {agent_id} not found")
+            conn.execute("UPDATE agents SET cash = cash + ? WHERE id = ?", (cash_delta, agent_id))
+            conn.execute(
+                "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
+                "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
+                (agent_id, market_id, shares_delta, shares_delta),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        updated = self.get_agent(agent_id)
+        pos = self.get_position(agent_id, market_id)
+        updated["yes_shares"] = pos["yes_shares"]
+        return updated
+
+    # ── LMSR Trading ──────────────────────────────────────────────────
+
+    def execute_lmsr_trade(
+        self, market_id: int, agent_id: int, quantity: float,
+    ) -> Dict[str, Any]:
+        """
+        Execute an LMSR trade.  Positive quantity = buy YES, negative = sell YES.
+        Clips to the largest affordable quantity when the agent has insufficient cash.
+        Uses LMSRMarketMaker from team_a_market_logic for all cost/price math.
+        """
+        if quantity == 0:
+            raise ValueError("quantity must be non-zero")
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
             if mkt is None:
                 raise ValueError(f"Market {market_id} not found")
-            if mkt["status"] != "open":
-                raise ValueError(f"Market {market_id} is {mkt['status']}, not open")
+            self._check_tradeable(mkt)
             if mkt["mechanism"] != "lmsr":
                 raise ValueError(
-                    f"execute_trade is for LMSR markets; market {market_id} uses "
-                    f"{mkt['mechanism']!r}. Use execute_limit_order / execute_market_order."
+                    f"execute_lmsr_trade is for LMSR markets; "
+                    f"market {market_id} uses {mkt['mechanism']!r}."
                 )
-
-            agent = conn.execute(
-                "SELECT * FROM agents WHERE id = ?", (agent_id,)
-            ).fetchone()
+            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
 
             b = mkt["b"]
-            old_yes, old_no = mkt["inv_yes"], mkt["inv_no"]
-            price_before = MarketStore._lmsr_price(old_yes, old_no, b)
-            old_cost = MarketStore._lmsr_cost(old_yes, old_no, b)
+            inv_yes, inv_no = float(mkt["inv_yes"]), float(mkt["inv_no"])
 
-            if side == "buy_yes":
-                new_yes, new_no = old_yes + shares, old_no
-                share_delta = shares
-            else:
-                new_yes, new_no = old_yes - shares, old_no
-                share_delta = -shares
+            mm = LMSRMarketMaker(b, [inv_yes, inv_no])
+            price_before = float(mm.get_price())
 
-            new_cost = MarketStore._lmsr_cost(new_yes, new_no, b)
-            cost = new_cost - old_cost
+            old_cost_val = float(mm.get_cost(mm.inventory))
+            full_inv = np.array([inv_yes + quantity, inv_no], dtype=float)
+            full_cost = float(mm.get_cost(full_inv)) - old_cost_val
 
-            if agent["cash"] < cost:
-                raise ValueError(
-                    f"Insufficient funds: agent has {agent['cash']:.4f}, "
-                    f"trade costs {cost:.4f}"
+            actual_quantity = quantity
+            clipped = False
+
+            if full_cost > agent["cash"] and quantity > 0:
+                actual_quantity = self._clip_lmsr_buy(
+                    inv_yes, inv_no, b, quantity, agent["cash"],
                 )
+                clipped = True
+                if actual_quantity < 1e-9:
+                    conn.execute("ROLLBACK")
+                    return {
+                        "trade_id": None, "market_id": market_id,
+                        "agent_id": agent_id, "quantity": 0.0,
+                        "requested_quantity": quantity, "clipped": True,
+                        "cost": 0.0, "price_before": price_before,
+                        "price_after": price_before,
+                    }
 
-            price_after = MarketStore._lmsr_price(new_yes, new_no, b)
+            exec_mm = LMSRMarketMaker(b, [inv_yes, inv_no])
+            cost = float(exec_mm.calculate_trade_cost(actual_quantity))
+            new_inv_yes = float(exec_mm.inventory[0])
+            new_inv_no = float(exec_mm.inventory[1])
+            price_after = float(exec_mm.get_price())
+
+            side = "buy_yes" if actual_quantity >= 0 else "sell_yes"
+            share_delta = actual_quantity
 
             conn.execute(
                 "UPDATE markets SET inv_yes = ?, inv_no = ? WHERE id = ?",
-                (new_yes, new_no, market_id),
+                (new_inv_yes, new_inv_no, market_id),
             )
+            conn.execute("UPDATE agents SET cash = cash - ? WHERE id = ?", (cost, agent_id))
             conn.execute(
-                "UPDATE agents SET cash = cash - ? WHERE id = ?",
-                (cost, agent_id),
-            )
-            conn.execute(
-                "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT(agent_id, market_id) "
-                "DO UPDATE SET yes_shares = yes_shares + ?",
+                "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
+                "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
                 (agent_id, market_id, share_delta, share_delta),
             )
             now = datetime.now(timezone.utc).isoformat()
@@ -336,7 +430,8 @@ class MarketService:
                 "INSERT INTO trades "
                 "(market_id, agent_id, side, shares, cost, price_before, price_after, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (market_id, agent_id, side, shares, cost, price_before, price_after, now),
+                (market_id, agent_id, side, abs(actual_quantity), cost,
+                 price_before, price_after, now),
             )
             trade_id = cur.lastrowid
             conn.execute("COMMIT")
@@ -345,49 +440,229 @@ class MarketService:
             raise
 
         return {
-            "trade_id": trade_id,
+            "trade_id": trade_id, "market_id": market_id, "agent_id": agent_id,
+            "quantity": actual_quantity, "requested_quantity": quantity,
+            "clipped": clipped, "cost": cost,
+            "price_before": price_before, "price_after": price_after,
+        }
+
+    def execute_trade(
+        self, agent_id: int, market_id: int, side: str, shares: float,
+    ) -> Dict[str, Any]:
+        """Backward-compatible wrapper around execute_lmsr_trade."""
+        if side not in ("buy_yes", "sell_yes"):
+            raise ValueError(f"side must be 'buy_yes' or 'sell_yes', got {side!r}")
+        if shares <= 0:
+            raise ValueError("shares must be positive")
+        quantity = shares if side == "buy_yes" else -shares
+        result = self.execute_lmsr_trade(market_id, agent_id, quantity)
+        if result["trade_id"] is None:
+            raise ValueError(
+                f"Insufficient funds: trade fully clipped to zero"
+            )
+        return {
+            "trade_id": result["trade_id"],
             "side": side,
-            "shares": shares,
-            "cost": cost,
+            "shares": abs(result["quantity"]),
+            "cost": result["cost"],
+            "price_before": result["price_before"],
+            "price_after": result["price_after"],
+        }
+
+    @staticmethod
+    def _clip_lmsr_buy(
+        inv_yes: float, inv_no: float, b: float,
+        max_quantity: float, max_cost: float,
+    ) -> float:
+        """Binary-search for the largest quantity whose LMSR cost <= max_cost."""
+        mm = LMSRMarketMaker(b, [inv_yes, inv_no])
+        old_cost_val = float(mm.get_cost(mm.inventory))
+        lo, hi = 0.0, max_quantity
+        for _ in range(64):
+            mid = (lo + hi) * 0.5
+            test_inv = np.array([inv_yes + mid, inv_no], dtype=float)
+            cost = float(mm.get_cost(test_inv)) - old_cost_val
+            if cost <= max_cost + 1e-12:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    # ── CDA Trading ────────────────────────────────────────────────────
+
+    def execute_cda_order(
+        self, market_id: int, agent_id: int, side: str,
+        quantity: float, limit_price: Optional[float],
+        order_type: str,
+    ) -> Dict[str, Any]:
+        """
+        Submit a CDA order.  order_type: 'limit' or 'market'.
+        Delegates matching to ContinuousDoubleAuction from team_b_market_logic.
+        """
+        if side not in ("buy", "sell"):
+            raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
+        if quantity <= 0:
+            raise ValueError("quantity must be positive")
+        if order_type not in ("limit", "market"):
+            raise ValueError(f"order_type must be 'limit' or 'market', got {order_type!r}")
+
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+            if mkt is None:
+                raise ValueError(f"Market {market_id} not found")
+            self._check_tradeable(mkt)
+            if mkt["mechanism"] != "cda":
+                raise ValueError(
+                    f"CDA methods are for CDA markets; "
+                    f"market {market_id} uses {mkt['mechanism']!r}."
+                )
+            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+            if agent is None:
+                raise ValueError(f"Agent {agent_id} not found")
+
+            price_before = self._cda_reference_price(conn, market_id)
+
+            cda, resting_lookup = self._hydrate_cda(conn, mkt)
+
+            if order_type == "limit":
+                cda_result = cda.submit_limit_order(
+                    agent_id=agent_id, side=side,
+                    quantity=quantity, limit_price=limit_price,
+                )
+            else:
+                cda_result = cda.submit_market_order(
+                    agent_id=agent_id, side=side, quantity=quantity,
+                )
+
+            persisted_trades: List[Dict[str, Any]] = []
+            total_filled = 0.0
+            now = datetime.now(timezone.utc).isoformat()
+
+            for trade in cda_result["trades"]:
+                fill_qty = trade.quantity
+                notional = trade.price * fill_qty
+
+                buyer_cash = conn.execute(
+                    "SELECT cash FROM agents WHERE id = ?", (trade.buyer_id,)
+                ).fetchone()["cash"]
+                if buyer_cash < notional:
+                    affordable = buyer_cash / trade.price if trade.price > 0 else 0.0
+                    if affordable < 1e-12:
+                        break
+                    fill_qty = affordable
+                    notional = trade.price * fill_qty
+
+                conn.execute(
+                    "UPDATE agents SET cash = cash - ? WHERE id = ?",
+                    (notional, trade.buyer_id),
+                )
+                conn.execute(
+                    "UPDATE agents SET cash = cash + ? WHERE id = ?",
+                    (notional, trade.seller_id),
+                )
+                conn.execute(
+                    "INSERT INTO positions (agent_id, market_id, yes_shares) "
+                    "VALUES (?, ?, ?) ON CONFLICT(agent_id, market_id) "
+                    "DO UPDATE SET yes_shares = yes_shares + ?",
+                    (trade.buyer_id, market_id, fill_qty, fill_qty),
+                )
+                conn.execute(
+                    "INSERT INTO positions (agent_id, market_id, yes_shares) "
+                    "VALUES (?, ?, ?) ON CONFLICT(agent_id, market_id) "
+                    "DO UPDATE SET yes_shares = yes_shares + ?",
+                    (trade.seller_id, market_id, -fill_qty, -fill_qty),
+                )
+                conn.execute(
+                    "UPDATE markets SET last_trade_price = ? WHERE id = ?",
+                    (trade.price, market_id),
+                )
+
+                cur = conn.execute(
+                    "INSERT INTO trades "
+                    "(market_id, agent_id, side, shares, cost, "
+                    " price_before, price_after, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (market_id, agent_id, trade.aggressor_side, fill_qty,
+                     notional, trade.price, trade.price, now),
+                )
+                persisted_trades.append({
+                    "trade_id": cur.lastrowid,
+                    "buyer_id": trade.buyer_id,
+                    "seller_id": trade.seller_id,
+                    "price": trade.price,
+                    "quantity": fill_qty,
+                    "aggressor_side": trade.aggressor_side,
+                })
+                total_filled += fill_qty
+
+                if trade.aggressor_side == "buy":
+                    resting_key = (trade.seller_id, "sell", trade.price)
+                else:
+                    resting_key = (trade.buyer_id, "buy", trade.price)
+
+                dq = resting_lookup.get(resting_key)
+                if dq:
+                    order_info = dq[0]
+                    order_info["remaining"] -= fill_qty
+                    if order_info["remaining"] <= 1e-12:
+                        conn.execute(
+                            "UPDATE orders SET remaining = 0, status = 'filled' WHERE id = ?",
+                            (order_info["db_id"],),
+                        )
+                        dq.popleft()
+                    else:
+                        conn.execute(
+                            "UPDATE orders SET remaining = ? WHERE id = ?",
+                            (order_info["remaining"], order_info["db_id"]),
+                        )
+
+                if fill_qty < trade.quantity:
+                    break
+
+            actual_remaining = quantity - total_filled
+            resting_order_id = None
+            if order_type == "limit" and actual_remaining > 1e-12 and limit_price is not None:
+                norm_price = cda._normalize_price(limit_price)
+                cur = conn.execute(
+                    "INSERT INTO orders "
+                    "(market_id, agent_id, side, price, quantity, remaining, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (market_id, agent_id, side, norm_price, quantity, actual_remaining, now),
+                )
+                resting_order_id = cur.lastrowid
+
+            price_after = self._cda_reference_price(conn, market_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        return {
+            "trades": persisted_trades,
+            "filled_quantity": total_filled,
+            "remaining_quantity": actual_remaining,
+            "resting_order_id": resting_order_id,
             "price_before": price_before,
             "price_after": price_after,
         }
 
-    # ── CDA Trading ────────────────────────────────────────────────────
-
     def execute_limit_order(
-        self,
-        agent_id: int,
-        market_id: int,
-        side: str,
-        quantity: float,
-        price: float,
+        self, agent_id: int, market_id: int, side: str,
+        quantity: float, price: float,
     ) -> Dict[str, Any]:
-        """Thread-safe CDA limit order. Crosses spread if price-improving."""
-        return self._execute_cda_order(
-            agent_id=agent_id,
-            market_id=market_id,
-            side=side,
-            quantity=quantity,
-            limit_price=price,
-            is_market=False,
+        """Backward-compatible wrapper around execute_cda_order."""
+        return self.execute_cda_order(
+            market_id, agent_id, side, quantity, price, "limit",
         )
 
     def execute_market_order(
-        self,
-        agent_id: int,
-        market_id: int,
-        side: str,
-        quantity: float,
+        self, agent_id: int, market_id: int, side: str, quantity: float,
     ) -> Dict[str, Any]:
-        """Thread-safe CDA market order. Walks the book, never rests."""
-        return self._execute_cda_order(
-            agent_id=agent_id,
-            market_id=market_id,
-            side=side,
-            quantity=quantity,
-            limit_price=None,
-            is_market=True,
+        """Backward-compatible wrapper around execute_cda_order."""
+        return self.execute_cda_order(
+            market_id, agent_id, side, quantity, None, "market",
         )
 
     def cancel_agent_orders(self, agent_id: int, market_id: int) -> int:
@@ -406,257 +681,11 @@ class MarketService:
             raise
         return count
 
-    def _execute_cda_order(
-        self,
-        *,
-        agent_id: int,
-        market_id: int,
-        side: str,
-        quantity: float,
-        limit_price: Optional[float],
-        is_market: bool,
-    ) -> Dict[str, Any]:
-        if side not in ("buy", "sell"):
-            raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
-        if quantity <= 0:
-            raise ValueError("quantity must be positive")
-
-        conn = self._get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            mkt = conn.execute(
-                "SELECT * FROM markets WHERE id = ?", (market_id,)
-            ).fetchone()
-            if mkt is None:
-                raise ValueError(f"Market {market_id} not found")
-            if mkt["status"] != "open":
-                raise ValueError(f"Market {market_id} is {mkt['status']}, not open")
-            if mkt["mechanism"] != "cda":
-                raise ValueError(
-                    f"CDA order methods are for CDA markets; market {market_id} uses "
-                    f"{mkt['mechanism']!r}. Use execute_trade."
-                )
-
-            agent = conn.execute(
-                "SELECT * FROM agents WHERE id = ?", (agent_id,)
-            ).fetchone()
-            if agent is None:
-                raise ValueError(f"Agent {agent_id} not found")
-
-            tick_size = mkt["tick_size"]
-            min_p, max_p = mkt["min_price"], mkt["max_price"]
-
-            if limit_price is not None:
-                clipped = min(max_p, max(min_p, float(limit_price)))
-                limit_price = round(clipped / tick_size) * tick_size
-
-            price_before = self._cda_reference_price(conn, market_id)
-            remaining = float(quantity)
-            matched_trades: List[Dict[str, Any]] = []
-            eps = 1e-12
-            now = datetime.now(timezone.utc).isoformat()
-
-            while remaining > eps:
-                if side == "buy":
-                    best = self._cda_best_ask(conn, market_id)
-                    if best is None:
-                        break
-                    if not is_market and limit_price is not None and limit_price < best:
-                        break
-                    resting = conn.execute(
-                        "SELECT * FROM orders "
-                        "WHERE market_id = ? AND side = 'sell' AND status = 'open' "
-                        "  AND price = ? ORDER BY id ASC LIMIT 1",
-                        (market_id, best),
-                    ).fetchone()
-                    if resting is None:
-                        break
-
-                    executed = min(remaining, resting["remaining"])
-                    trade_price = resting["price"]
-                    notional = trade_price * executed
-
-                    buyer_cash = conn.execute(
-                        "SELECT cash FROM agents WHERE id = ?", (agent_id,)
-                    ).fetchone()["cash"]
-                    if buyer_cash < notional:
-                        break
-
-                    conn.execute(
-                        "UPDATE agents SET cash = cash - ? WHERE id = ?",
-                        (notional, agent_id),
-                    )
-                    conn.execute(
-                        "UPDATE agents SET cash = cash + ? WHERE id = ?",
-                        (notional, resting["agent_id"]),
-                    )
-                    conn.execute(
-                        "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(agent_id, market_id) "
-                        "DO UPDATE SET yes_shares = yes_shares + ?",
-                        (agent_id, market_id, executed, executed),
-                    )
-                    conn.execute(
-                        "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(agent_id, market_id) "
-                        "DO UPDATE SET yes_shares = yes_shares + ?",
-                        (resting["agent_id"], market_id, -executed, -executed),
-                    )
-
-                    new_rem = resting["remaining"] - executed
-                    if new_rem <= eps:
-                        conn.execute(
-                            "UPDATE orders SET remaining = 0, status = 'filled' WHERE id = ?",
-                            (resting["id"],),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE orders SET remaining = ? WHERE id = ?",
-                            (new_rem, resting["id"]),
-                        )
-
-                    conn.execute(
-                        "UPDATE markets SET last_trade_price = ? WHERE id = ?",
-                        (trade_price, market_id),
-                    )
-                    cur = conn.execute(
-                        "INSERT INTO trades "
-                        "(market_id, agent_id, side, shares, cost, "
-                        " price_before, price_after, created_at) "
-                        "VALUES (?, ?, 'buy', ?, ?, ?, ?, ?)",
-                        (market_id, agent_id, executed, notional,
-                         trade_price, trade_price, now),
-                    )
-                    matched_trades.append({
-                        "trade_id": cur.lastrowid,
-                        "buyer_id": agent_id,
-                        "seller_id": resting["agent_id"],
-                        "price": trade_price,
-                        "quantity": executed,
-                        "aggressor_side": "buy",
-                    })
-                    remaining -= executed
-
-                else:  # sell
-                    best = self._cda_best_bid(conn, market_id)
-                    if best is None:
-                        break
-                    if not is_market and limit_price is not None and limit_price > best:
-                        break
-                    resting = conn.execute(
-                        "SELECT * FROM orders "
-                        "WHERE market_id = ? AND side = 'buy' AND status = 'open' "
-                        "  AND price = ? ORDER BY id ASC LIMIT 1",
-                        (market_id, best),
-                    ).fetchone()
-                    if resting is None:
-                        break
-
-                    executed = min(remaining, resting["remaining"])
-                    trade_price = resting["price"]
-                    notional = trade_price * executed
-
-                    resting_buyer_cash = conn.execute(
-                        "SELECT cash FROM agents WHERE id = ?", (resting["agent_id"],)
-                    ).fetchone()["cash"]
-                    if resting_buyer_cash < notional:
-                        conn.execute(
-                            "UPDATE orders SET status = 'cancelled' WHERE id = ?",
-                            (resting["id"],),
-                        )
-                        continue
-
-                    conn.execute(
-                        "UPDATE agents SET cash = cash + ? WHERE id = ?",
-                        (notional, agent_id),
-                    )
-                    conn.execute(
-                        "UPDATE agents SET cash = cash - ? WHERE id = ?",
-                        (notional, resting["agent_id"]),
-                    )
-                    conn.execute(
-                        "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(agent_id, market_id) "
-                        "DO UPDATE SET yes_shares = yes_shares + ?",
-                        (agent_id, market_id, -executed, -executed),
-                    )
-                    conn.execute(
-                        "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(agent_id, market_id) "
-                        "DO UPDATE SET yes_shares = yes_shares + ?",
-                        (resting["agent_id"], market_id, executed, executed),
-                    )
-
-                    new_rem = resting["remaining"] - executed
-                    if new_rem <= eps:
-                        conn.execute(
-                            "UPDATE orders SET remaining = 0, status = 'filled' WHERE id = ?",
-                            (resting["id"],),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE orders SET remaining = ? WHERE id = ?",
-                            (new_rem, resting["id"]),
-                        )
-
-                    conn.execute(
-                        "UPDATE markets SET last_trade_price = ? WHERE id = ?",
-                        (trade_price, market_id),
-                    )
-                    cur = conn.execute(
-                        "INSERT INTO trades "
-                        "(market_id, agent_id, side, shares, cost, "
-                        " price_before, price_after, created_at) "
-                        "VALUES (?, ?, 'sell', ?, ?, ?, ?, ?)",
-                        (market_id, agent_id, executed, notional,
-                         trade_price, trade_price, now),
-                    )
-                    matched_trades.append({
-                        "trade_id": cur.lastrowid,
-                        "buyer_id": resting["agent_id"],
-                        "seller_id": agent_id,
-                        "price": trade_price,
-                        "quantity": executed,
-                        "aggressor_side": "sell",
-                    })
-                    remaining -= executed
-
-            resting_order_id = None
-            if not is_market and remaining > eps and limit_price is not None:
-                cur = conn.execute(
-                    "INSERT INTO orders "
-                    "(market_id, agent_id, side, price, quantity, remaining, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (market_id, agent_id, side, limit_price, quantity, remaining, now),
-                )
-                resting_order_id = cur.lastrowid
-
-            price_after = self._cda_reference_price(conn, market_id)
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-
-        return {
-            "trades": matched_trades,
-            "filled_quantity": quantity - remaining,
-            "remaining_quantity": remaining,
-            "resting_order_id": resting_order_id,
-            "price_before": price_before,
-            "price_after": price_after,
-        }
-
     # ── Trade history ──────────────────────────────────────────────────
 
     def get_trades(
-        self,
-        market_id: Optional[int] = None,
-        agent_id: Optional[int] = None,
-        limit: int = 100,
+        self, market_id: Optional[int] = None, agent_id: Optional[int] = None,
+        since_trade_id: Optional[int] = None, limit: int = 100,
     ) -> List[Dict[str, Any]]:
         conn = self._get_conn()
         clauses: List[str] = []
@@ -667,6 +696,9 @@ class MarketService:
         if agent_id is not None:
             clauses.append("agent_id = ?")
             params.append(agent_id)
+        if since_trade_id is not None:
+            clauses.append("id > ?")
+            params.append(since_trade_id)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         rows = conn.execute(
@@ -674,7 +706,44 @@ class MarketService:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # ── CDA helpers (take explicit conn for use inside transactions) ──
+    # ── CDA internal helpers ───────────────────────────────────────────
+
+    def _hydrate_cda(self, conn: sqlite3.Connection, mkt: sqlite3.Row):
+        """
+        Reconstruct a ContinuousDoubleAuction from DB order book state.
+        Returns (cda, resting_lookup) where resting_lookup maps
+        (agent_id, side, price) -> deque of {db_id, remaining} dicts
+        for reconciling fills back to DB rows.
+        """
+        cda = ContinuousDoubleAuction(
+            tick_size=mkt["tick_size"],
+            min_price=mkt["min_price"],
+            max_price=mkt["max_price"],
+            initial_reference_price=mkt["initial_price"],
+        )
+        if mkt["last_trade_price"] is not None:
+            cda.last_trade_price = mkt["last_trade_price"]
+
+        resting_lookup: Dict[tuple, deque] = defaultdict(deque)
+
+        orders = conn.execute(
+            "SELECT * FROM orders WHERE market_id = ? AND status = 'open' ORDER BY id ASC",
+            (mkt["id"],),
+        ).fetchall()
+        for o in orders:
+            cda._add_resting_order(
+                agent_id=o["agent_id"],
+                side=o["side"],
+                quantity=float(o["remaining"]),
+                price=float(o["price"]),
+            )
+            key = (o["agent_id"], o["side"], float(o["price"]))
+            resting_lookup[key].append({
+                "db_id": o["id"],
+                "remaining": float(o["remaining"]),
+            })
+
+        return cda, resting_lookup
 
     @staticmethod
     def _cda_best_bid(conn: sqlite3.Connection, market_id: int) -> Optional[float]:
