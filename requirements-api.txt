@@ -2,5 +2,6 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 numpy>=1.24
 pydantic>=2.0
+requests>=2.32.5
 
 # Optional: agent comments via local Ollama — no extra Python deps (uses stdlib urllib).
