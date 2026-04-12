@@ -1,9 +1,10 @@
 """
 Thread-safe market service with transactional trade execution for LMSR and CDA.
 
-Depends on MarketStore for schema/conversions, LMSRMarketMaker (team_a) for
-LMSR cost-function math, and ContinuousDoubleAuction (team_b) for CDA order
-matching.  Does not re-implement either pricing or matching logic.
+Depends on MarketStore for persistence and row conversion, LMSRMarketMaker
+(team_a) for LMSR cost-function math, and ContinuousDoubleAuction (team_b)
+for CDA order matching.  Does not re-implement either pricing or matching
+logic.
 
 Usage:
     svc = MarketService("markets.db")
@@ -19,6 +20,7 @@ import sqlite3
 import sys
 import threading
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,13 +34,18 @@ if str(_SRC) not in sys.path:
 from team_a_market_logic import LMSRMarketMaker
 from team_b_market_logic import ContinuousDoubleAuction, Trade
 
-from market_store import MarketStore, _SCHEMA, _VALID_MARKET_STATUSES, _TRADEABLE_STATUSES
+from market_store import MarketStore, _SCHEMA, _TRADEABLE_STATUSES
 
 _BUSY_TIMEOUT_MS = 5000
 
 
 class MarketService:
-    """Thread-safe market service backed by a shared SQLite database."""
+    """Thread-safe market service backed by a shared SQLite database.
+
+    Creates per-thread connections and per-thread ``MarketStore`` instances
+    (with ``_external_transactions=True``) so that all write operations are
+    serialized via ``BEGIN IMMEDIATE``.
+    """
 
     def __init__(self, db_path: str):
         if db_path == ":memory:":
@@ -52,6 +59,8 @@ class MarketService:
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
 
+    # ── Connection / store management ─────────────────────────────────
+
     def _get_conn(self) -> sqlite3.Connection:
         conn: Optional[sqlite3.Connection] = getattr(self._local, "conn", None)
         if conn is None:
@@ -64,21 +73,58 @@ class MarketService:
             self._local.conn = conn
         return conn
 
+    def _get_store(self) -> MarketStore:
+        store: Optional[MarketStore] = getattr(self._local, "store", None)
+        if store is None:
+            store = MarketStore(
+                _conn=self._get_conn(), _external_transactions=True,
+            )
+            self._local.store = store
+        return store
+
+    @contextmanager
+    def _begin_immediate(self):
+        """Context manager: wraps body in BEGIN IMMEDIATE / COMMIT / ROLLBACK."""
+        conn = self._get_store().conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
     def close(self) -> None:
         conn: Optional[sqlite3.Connection] = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
             self._local.conn = None
+            self._local.store = None
 
-    @staticmethod
-    def _check_tradeable(mkt: sqlite3.Row) -> None:
-        if mkt["status"] not in _TRADEABLE_STATUSES:
-            raise ValueError(
-                f"Market {mkt['id']} has status {mkt['status']!r}; "
-                f"trading requires one of {_TRADEABLE_STATUSES}"
-            )
+    # ── Read operations (delegate to MarketStore) ─────────────────────
 
-    # ── Markets ────────────────────────────────────────────────────────
+    def get_market(self, market_id: int) -> Dict[str, Any]:
+        return self._get_store().get_market(market_id)
+
+    def list_markets(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self._get_store().list_markets(status)
+
+    def get_agent(self, agent_id: int, market_id: Optional[int] = None) -> Dict[str, Any]:
+        return self._get_store().get_agent(agent_id, market_id)
+
+    def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
+        return self._get_store().get_position(agent_id, market_id)
+
+    def get_order_book(self, market_id: int) -> Dict[str, Any]:
+        return self._get_store().get_order_book(market_id)
+
+    def get_trades(
+        self, market_id: Optional[int] = None, agent_id: Optional[int] = None,
+        since_trade_id: Optional[int] = None, limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        return self._get_store().get_trades(market_id, agent_id, since_trade_id, limit)
+
+    # ── Write operations (delegate with BEGIN IMMEDIATE) ──────────────
 
     def create_market(
         self, slug: str, title: str, *, mechanism: str = "lmsr",
@@ -87,138 +133,67 @@ class MarketService:
         min_price: float = 0.001, max_price: float = 0.999,
         initial_price: float = 0.5,
     ) -> Dict[str, Any]:
-        if mechanism not in ("lmsr", "cda"):
-            raise ValueError(f"mechanism must be 'lmsr' or 'cda', got {mechanism!r}")
-        if mechanism == "lmsr" and b is None:
-            raise ValueError("b (liquidity parameter) is required for LMSR markets")
-        if mechanism == "lmsr" and b is not None and b <= 0:
-            raise ValueError("b must be positive")
-        conn = self._get_conn()
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = conn.execute(
-                "INSERT INTO markets "
-                "(slug, title, description, mechanism, ground_truth, b, tick_size, "
-                " min_price, max_price, initial_price, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (slug, title, description, mechanism, ground_truth, b, tick_size,
-                 min_price, max_price, initial_price, now),
+        with self._begin_immediate():
+            return self._get_store().create_market(
+                slug, title, mechanism=mechanism, b=b, ground_truth=ground_truth,
+                description=description, tick_size=tick_size,
+                min_price=min_price, max_price=max_price,
+                initial_price=initial_price,
             )
-            row = conn.execute("SELECT * FROM markets WHERE id = ?", (cur.lastrowid,)).fetchone()
-            conn.execute("COMMIT")
-            return MarketStore._market_row_to_dict(row)
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
 
-    def get_market(self, market_id: int) -> Dict[str, Any]:
-        conn = self._get_conn()
-        row = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
-        if row is None:
-            raise ValueError(f"Market {market_id} not found")
-        return MarketStore._market_row_to_dict(row)
-
-    def list_markets(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        conn = self._get_conn()
-        if status is not None:
-            rows = conn.execute("SELECT * FROM markets WHERE status = ? ORDER BY id", (status,)).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM markets ORDER BY id").fetchall()
-        return [MarketStore._market_row_to_dict(r) for r in rows]
+    def create_agent(
+        self, name: str, cash: float, *, market_id: Optional[int] = None,
+        belief: Optional[float] = None, rho: Optional[float] = None,
+        personality: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._begin_immediate():
+            return self._get_store().create_agent(
+                name, cash, market_id=market_id, belief=belief,
+                rho=rho, personality=personality,
+            )
 
     def set_market_status(self, market_id: int, status: str) -> Dict[str, Any]:
-        if status not in _VALID_MARKET_STATUSES:
-            raise ValueError(f"status must be one of {_VALID_MARKET_STATUSES}, got {status!r}")
-        conn = self._get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
-            if mkt is None:
-                raise ValueError(f"Market {market_id} not found")
-            if mkt["status"] == "resolved":
-                raise ValueError(f"Market {market_id} is resolved and cannot change status")
-            conn.execute("UPDATE markets SET status = ? WHERE id = ?", (status, market_id))
-            row = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
-            conn.execute("COMMIT")
-            return MarketStore._market_row_to_dict(row)
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        with self._begin_immediate():
+            return self._get_store().set_market_status(market_id, status)
 
-    def get_order_book(self, market_id: int) -> Dict[str, Any]:
-        conn = self._get_conn()
-        bids = conn.execute(
-            "SELECT price, SUM(remaining) as total_qty FROM orders "
-            "WHERE market_id = ? AND side = 'buy' AND status = 'open' "
-            "GROUP BY price ORDER BY price DESC", (market_id,),
-        ).fetchall()
-        asks = conn.execute(
-            "SELECT price, SUM(remaining) as total_qty FROM orders "
-            "WHERE market_id = ? AND side = 'sell' AND status = 'open' "
-            "GROUP BY price ORDER BY price ASC", (market_id,),
-        ).fetchall()
-        return {
-            "bids": [{"price": r["price"], "quantity": r["total_qty"]} for r in bids],
-            "asks": [{"price": r["price"], "quantity": r["total_qty"]} for r in asks],
-            "best_bid": self._cda_best_bid(conn, market_id),
-            "best_ask": self._cda_best_ask(conn, market_id),
-        }
+    def set_agent_belief(self, market_id: int, agent_id: int, new_belief: float) -> float:
+        with self._begin_immediate():
+            return self._get_store().set_agent_belief(market_id, agent_id, new_belief)
+
+    def update_agent_portfolio(
+        self, market_id: int, agent_id: int, cash_delta: float, shares_delta: float,
+    ) -> Dict[str, Any]:
+        with self._begin_immediate():
+            return self._get_store().update_agent_portfolio(
+                market_id, agent_id, cash_delta, shares_delta,
+            )
 
     def resolve_market(self, market_id: int, outcome: str) -> Dict[str, Any]:
-        if outcome not in ("yes", "no"):
-            raise ValueError(f"outcome must be 'yes' or 'no', got {outcome!r}")
-        payoff = 1.0 if outcome == "yes" else 0.0
-        now = datetime.now(timezone.utc).isoformat()
-        conn = self._get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
-            if mkt is None:
-                raise ValueError(f"Market {market_id} not found")
-            if mkt["status"] == "resolved":
-                raise ValueError(f"Market {market_id} is already resolved")
-            conn.execute(
-                "UPDATE orders SET status = 'cancelled' WHERE market_id = ? AND status = 'open'",
-                (market_id,),
-            )
-            conn.execute(
-                "UPDATE markets SET status = 'resolved', resolution = ?, resolved_at = ? WHERE id = ?",
-                (outcome, now, market_id),
-            )
-            positions = conn.execute(
-                "SELECT agent_id, yes_shares FROM positions WHERE market_id = ?", (market_id,)
-            ).fetchall()
-            for pos in positions:
-                conn.execute(
-                    "UPDATE agents SET cash = cash + ? WHERE id = ?",
-                    (pos["yes_shares"] * payoff, pos["agent_id"]),
-                )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        return {"market_id": market_id, "outcome": outcome, "positions_settled": len(positions)}
+        with self._begin_immediate():
+            return self._get_store().resolve_market(market_id, outcome)
 
-    # ── Pricing ────────────────────────────────────────────────────────
+    def cancel_agent_orders(self, agent_id: int, market_id: int) -> int:
+        with self._begin_immediate():
+            return self._get_store().cancel_agent_orders(agent_id, market_id)
+
+    # ── Pricing (uses LMSRMarketMaker for team_a delegation) ──────────
 
     def get_price(self, market_id: int) -> float:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT mechanism, inv_yes, inv_no, b FROM markets WHERE id = ?", (market_id,)
+        store = self._get_store()
+        row = store.conn.execute(
+            "SELECT mechanism, inv_yes, inv_no, b FROM markets WHERE id = ?",
+            (market_id,),
         ).fetchone()
         if row is None:
             raise ValueError(f"Market {market_id} not found")
         if row["mechanism"] == "lmsr":
             mm = LMSRMarketMaker(row["b"], [row["inv_yes"], row["inv_no"]])
             return float(mm.get_price())
-        return self._cda_reference_price(conn, market_id)
+        return store._cda_reference_price(market_id)
 
     def get_price_snapshot(self, market_id: int) -> Dict[str, Any]:
-        conn = self._get_conn()
-        mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
-        if mkt is None:
-            raise ValueError(f"Market {market_id} not found")
+        store = self._get_store()
+        mkt = store.get_market(market_id)
         result: Dict[str, Any] = {
             "market_id": market_id,
             "mechanism": mkt["mechanism"],
@@ -231,124 +206,11 @@ class MarketService:
             result["inv_no"] = mkt["inv_no"]
             result["b"] = mkt["b"]
         else:
-            result["price"] = self._cda_reference_price(conn, market_id)
-            result["best_bid"] = self._cda_best_bid(conn, market_id)
-            result["best_ask"] = self._cda_best_ask(conn, market_id)
+            result["price"] = store._cda_reference_price(market_id)
+            result["best_bid"] = store._cda_best_bid(market_id)
+            result["best_ask"] = store._cda_best_ask(market_id)
             result["last_trade_price"] = mkt["last_trade_price"]
         return result
-
-    # ── Agents ─────────────────────────────────────────────────────────
-
-    def create_agent(
-        self, name: str, cash: float, *, market_id: Optional[int] = None,
-        belief: Optional[float] = None, rho: Optional[float] = None,
-        personality: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        conn = self._get_conn()
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = conn.execute(
-                "INSERT INTO agents (name, cash, created_at) VALUES (?, ?, ?)", (name, cash, now)
-            )
-            agent_id = cur.lastrowid
-            if market_id is not None:
-                conn.execute(
-                    "INSERT INTO positions (agent_id, market_id, yes_shares, belief, rho, personality) "
-                    "VALUES (?, ?, 0.0, ?, ?, ?)",
-                    (agent_id, market_id, belief, rho, personality),
-                )
-            row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
-            conn.execute("COMMIT")
-            result = MarketStore._agent_row_to_dict(row)
-            if market_id is not None:
-                result.update({"belief": belief, "rho": rho, "personality": personality})
-            return result
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-
-    def get_agent(self, agent_id: int, market_id: Optional[int] = None) -> Dict[str, Any]:
-        conn = self._get_conn()
-        row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
-        if row is None:
-            raise ValueError(f"Agent {agent_id} not found")
-        result = MarketStore._agent_row_to_dict(row)
-        if market_id is not None:
-            pos = conn.execute(
-                "SELECT * FROM positions WHERE agent_id = ? AND market_id = ?",
-                (agent_id, market_id),
-            ).fetchone()
-            if pos is not None:
-                result.update({
-                    "yes_shares": pos["yes_shares"], "belief": pos["belief"],
-                    "rho": pos["rho"], "personality": pos["personality"],
-                })
-            else:
-                result.update({"yes_shares": 0.0, "belief": None, "rho": None, "personality": None})
-        return result
-
-    def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM positions WHERE agent_id = ? AND market_id = ?",
-            (agent_id, market_id),
-        ).fetchone()
-        if row is None:
-            return {
-                "agent_id": agent_id, "market_id": market_id, "yes_shares": 0.0,
-                "belief": None, "rho": None, "personality": None,
-            }
-        return {
-            "agent_id": row["agent_id"], "market_id": row["market_id"],
-            "yes_shares": row["yes_shares"], "belief": row["belief"],
-            "rho": row["rho"], "personality": row["personality"],
-        }
-
-    def set_agent_belief(self, market_id: int, agent_id: int, new_belief: float) -> float:
-        conn = self._get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = conn.execute(
-                "SELECT belief FROM positions WHERE agent_id = ? AND market_id = ?",
-                (agent_id, market_id),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"No position for agent {agent_id} in market {market_id}")
-            old_belief = row["belief"]
-            conn.execute(
-                "UPDATE positions SET belief = ? WHERE agent_id = ? AND market_id = ?",
-                (new_belief, agent_id, market_id),
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        return old_belief
-
-    def update_agent_portfolio(
-        self, market_id: int, agent_id: int, cash_delta: float, shares_delta: float,
-    ) -> Dict[str, Any]:
-        conn = self._get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
-            if agent is None:
-                raise ValueError(f"Agent {agent_id} not found")
-            conn.execute("UPDATE agents SET cash = cash + ? WHERE id = ?", (cash_delta, agent_id))
-            conn.execute(
-                "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
-                "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
-                (agent_id, market_id, shares_delta, shares_delta),
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        updated = self.get_agent(agent_id)
-        pos = self.get_position(agent_id, market_id)
-        updated["yes_shares"] = pos["yes_shares"]
-        return updated
 
     # ── LMSR Trading ──────────────────────────────────────────────────
 
@@ -362,19 +224,24 @@ class MarketService:
         """
         if quantity == 0:
             raise ValueError("quantity must be non-zero")
-        conn = self._get_conn()
+        store = self._get_store()
+        conn = store.conn
         conn.execute("BEGIN IMMEDIATE")
         try:
-            mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+            mkt = conn.execute(
+                "SELECT * FROM markets WHERE id = ?", (market_id,)
+            ).fetchone()
             if mkt is None:
                 raise ValueError(f"Market {market_id} not found")
-            self._check_tradeable(mkt)
+            store._check_tradeable(mkt)
             if mkt["mechanism"] != "lmsr":
                 raise ValueError(
                     f"execute_lmsr_trade is for LMSR markets; "
                     f"market {market_id} uses {mkt['mechanism']!r}."
                 )
-            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+            agent = conn.execute(
+                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+            ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
 
@@ -419,7 +286,10 @@ class MarketService:
                 "UPDATE markets SET inv_yes = ?, inv_no = ? WHERE id = ?",
                 (new_inv_yes, new_inv_no, market_id),
             )
-            conn.execute("UPDATE agents SET cash = cash - ? WHERE id = ?", (cost, agent_id))
+            conn.execute(
+                "UPDATE agents SET cash = cash - ? WHERE id = ?",
+                (cost, agent_id),
+            )
             conn.execute(
                 "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
                 "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
@@ -506,25 +376,30 @@ class MarketService:
         if order_type not in ("limit", "market"):
             raise ValueError(f"order_type must be 'limit' or 'market', got {order_type!r}")
 
-        conn = self._get_conn()
+        store = self._get_store()
+        conn = store.conn
         conn.execute("BEGIN IMMEDIATE")
         try:
-            mkt = conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+            mkt = conn.execute(
+                "SELECT * FROM markets WHERE id = ?", (market_id,)
+            ).fetchone()
             if mkt is None:
                 raise ValueError(f"Market {market_id} not found")
-            self._check_tradeable(mkt)
+            store._check_tradeable(mkt)
             if mkt["mechanism"] != "cda":
                 raise ValueError(
                     f"CDA methods are for CDA markets; "
                     f"market {market_id} uses {mkt['mechanism']!r}."
                 )
-            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+            agent = conn.execute(
+                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+            ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
 
-            price_before = self._cda_reference_price(conn, market_id)
+            price_before = store._cda_reference_price(market_id)
 
-            cda, resting_lookup = self._hydrate_cda(conn, mkt)
+            cda, resting_lookup = self._hydrate_cda(store, mkt)
 
             if order_type == "limit":
                 cda_result = cda.submit_limit_order(
@@ -633,7 +508,7 @@ class MarketService:
                 )
                 resting_order_id = cur.lastrowid
 
-            price_after = self._cda_reference_price(conn, market_id)
+            price_after = store._cda_reference_price(market_id)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -665,50 +540,10 @@ class MarketService:
             market_id, agent_id, side, quantity, None, "market",
         )
 
-    def cancel_agent_orders(self, agent_id: int, market_id: int) -> int:
-        conn = self._get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = conn.execute(
-                "UPDATE orders SET status = 'cancelled' "
-                "WHERE agent_id = ? AND market_id = ? AND status = 'open'",
-                (agent_id, market_id),
-            )
-            count = cur.rowcount
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        return count
-
-    # ── Trade history ──────────────────────────────────────────────────
-
-    def get_trades(
-        self, market_id: Optional[int] = None, agent_id: Optional[int] = None,
-        since_trade_id: Optional[int] = None, limit: int = 100,
-    ) -> List[Dict[str, Any]]:
-        conn = self._get_conn()
-        clauses: List[str] = []
-        params: List[Any] = []
-        if market_id is not None:
-            clauses.append("market_id = ?")
-            params.append(market_id)
-        if agent_id is not None:
-            clauses.append("agent_id = ?")
-            params.append(agent_id)
-        if since_trade_id is not None:
-            clauses.append("id > ?")
-            params.append(since_trade_id)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        params.append(limit)
-        rows = conn.execute(
-            f"SELECT * FROM trades{where} ORDER BY id DESC LIMIT ?", params
-        ).fetchall()
-        return [dict(r) for r in rows]
-
     # ── CDA internal helpers ───────────────────────────────────────────
 
-    def _hydrate_cda(self, conn: sqlite3.Connection, mkt: sqlite3.Row):
+    @staticmethod
+    def _hydrate_cda(store: MarketStore, mkt):
         """
         Reconstruct a ContinuousDoubleAuction from DB order book state.
         Returns (cda, resting_lookup) where resting_lookup maps
@@ -726,7 +561,7 @@ class MarketService:
 
         resting_lookup: Dict[tuple, deque] = defaultdict(deque)
 
-        orders = conn.execute(
+        orders = store.conn.execute(
             "SELECT * FROM orders WHERE market_id = ? AND status = 'open' ORDER BY id ASC",
             (mkt["id"],),
         ).fetchall()
@@ -744,39 +579,3 @@ class MarketService:
             })
 
         return cda, resting_lookup
-
-    @staticmethod
-    def _cda_best_bid(conn: sqlite3.Connection, market_id: int) -> Optional[float]:
-        row = conn.execute(
-            "SELECT MAX(price) AS p FROM orders "
-            "WHERE market_id = ? AND side = 'buy' AND status = 'open'",
-            (market_id,),
-        ).fetchone()
-        return row["p"] if row and row["p"] is not None else None
-
-    @staticmethod
-    def _cda_best_ask(conn: sqlite3.Connection, market_id: int) -> Optional[float]:
-        row = conn.execute(
-            "SELECT MIN(price) AS p FROM orders "
-            "WHERE market_id = ? AND side = 'sell' AND status = 'open'",
-            (market_id,),
-        ).fetchone()
-        return row["p"] if row and row["p"] is not None else None
-
-    @staticmethod
-    def _cda_reference_price(conn: sqlite3.Connection, market_id: int) -> float:
-        bid = MarketService._cda_best_bid(conn, market_id)
-        ask = MarketService._cda_best_ask(conn, market_id)
-        if bid is not None and ask is not None:
-            return 0.5 * (bid + ask)
-        mkt = conn.execute(
-            "SELECT last_trade_price, initial_price FROM markets WHERE id = ?",
-            (market_id,),
-        ).fetchone()
-        if mkt["last_trade_price"] is not None:
-            return mkt["last_trade_price"]
-        if bid is not None:
-            return bid
-        if ask is not None:
-            return ask
-        return mkt["initial_price"]

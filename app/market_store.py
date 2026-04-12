@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -98,17 +99,45 @@ CREATE TABLE IF NOT EXISTS orders (
 
 
 class MarketStore:
-    """SQLite-backed multi-market prediction market (LMSR + CDA)."""
+    """SQLite-backed multi-market prediction market (LMSR + CDA).
 
-    def __init__(self, db_path: str = ":memory:"):
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(_SCHEMA)
+    When ``_conn`` is provided, the store wraps that connection instead of
+    creating its own.  When ``_external_transactions`` is True, all internal
+    transaction management is skipped (the caller — typically MarketService —
+    is responsible for BEGIN / COMMIT / ROLLBACK).
+    """
+
+    def __init__(
+        self,
+        db_path: str = ":memory:",
+        *,
+        _conn: Optional[sqlite3.Connection] = None,
+        _external_transactions: bool = False,
+    ):
+        self._ext_txn = _external_transactions
+        if _conn is not None:
+            self.conn = _conn
+            self._owns_conn = False
+        else:
+            self.conn = sqlite3.connect(db_path)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.executescript(_SCHEMA)
+            self._owns_conn = True
 
     def close(self) -> None:
-        self.conn.close()
+        if self._owns_conn:
+            self.conn.close()
+
+    @contextmanager
+    def _transaction(self):
+        """Wraps the body in a transaction, unless externally managed."""
+        if self._ext_txn:
+            yield
+        else:
+            with self.conn:
+                yield
 
     # ── LMSR math (pure functions) ─────────────────────────────────────
 
@@ -194,18 +223,19 @@ class MarketStore:
             raise ValueError("b must be positive")
 
         now = datetime.now(timezone.utc).isoformat()
-        cur = self.conn.execute(
-            "INSERT INTO markets "
-            "(slug, title, description, mechanism, ground_truth, b, tick_size, "
-            " min_price, max_price, initial_price, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (slug, title, description, mechanism, ground_truth, b, tick_size,
-             min_price, max_price, initial_price, now),
-        )
-        self.conn.commit()
-        return self._market_row_to_dict(
-            self.conn.execute("SELECT * FROM markets WHERE id = ?", (cur.lastrowid,)).fetchone()
-        )
+        with self._transaction():
+            cur = self.conn.execute(
+                "INSERT INTO markets "
+                "(slug, title, description, mechanism, ground_truth, b, tick_size, "
+                " min_price, max_price, initial_price, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (slug, title, description, mechanism, ground_truth, b, tick_size,
+                 min_price, max_price, initial_price, now),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM markets WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+        return self._market_row_to_dict(row)
 
     def get_market(self, market_id: int) -> Dict[str, Any]:
         row = self.conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
@@ -238,7 +268,7 @@ class MarketStore:
             raise ValueError(
                 f"status must be one of {_VALID_MARKET_STATUSES}, got {status!r}"
             )
-        with self.conn:
+        with self._transaction():
             mkt = self.conn.execute(
                 "SELECT * FROM markets WHERE id = ?", (market_id,)
             ).fetchone()
@@ -276,7 +306,7 @@ class MarketStore:
             raise ValueError(f"outcome must be 'yes' or 'no', got {outcome!r}")
         payoff = 1.0 if outcome == "yes" else 0.0
         now = datetime.now(timezone.utc).isoformat()
-        with self.conn:
+        with self._transaction():
             mkt = self.conn.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
             if mkt is None:
                 raise ValueError(f"Market {market_id} not found")
@@ -321,7 +351,7 @@ class MarketStore:
         personality: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
-        with self.conn:
+        with self._transaction():
             cur = self.conn.execute(
                 "INSERT INTO agents (name, cash, created_at) VALUES (?, ?, ?)",
                 (name, cash, now),
@@ -366,7 +396,7 @@ class MarketStore:
         self, market_id: int, agent_id: int, new_belief: float
     ) -> float:
         """Update agent's belief for a market. Returns the old belief."""
-        with self.conn:
+        with self._transaction():
             row = self.conn.execute(
                 "SELECT belief FROM positions WHERE agent_id = ? AND market_id = ?",
                 (agent_id, market_id),
@@ -390,7 +420,7 @@ class MarketStore:
         shares_delta: float,
     ) -> Dict[str, Any]:
         """Directly adjust an agent's cash and shares for a market."""
-        with self.conn:
+        with self._transaction():
             agent = self.conn.execute(
                 "SELECT * FROM agents WHERE id = ?", (agent_id,)
             ).fetchone()
@@ -447,7 +477,7 @@ class MarketStore:
         if shares <= 0:
             raise ValueError("shares must be positive")
 
-        with self.conn:
+        with self._transaction():
             mkt = self.conn.execute(
                 "SELECT * FROM markets WHERE id = ?", (market_id,)
             ).fetchone()
@@ -541,12 +571,12 @@ class MarketStore:
         )
 
     def cancel_agent_orders(self, agent_id: int, market_id: int) -> int:
-        cur = self.conn.execute(
-            "UPDATE orders SET status = 'cancelled' "
-            "WHERE agent_id = ? AND market_id = ? AND status = 'open'",
-            (agent_id, market_id),
-        )
-        self.conn.commit()
+        with self._transaction():
+            cur = self.conn.execute(
+                "UPDATE orders SET status = 'cancelled' "
+                "WHERE agent_id = ? AND market_id = ? AND status = 'open'",
+                (agent_id, market_id),
+            )
         return cur.rowcount
 
     def _submit_cda_order(
@@ -558,7 +588,7 @@ class MarketStore:
         if quantity <= 0:
             raise ValueError("quantity must be positive")
 
-        with self.conn:
+        with self._transaction():
             mkt = self.conn.execute(
                 "SELECT * FROM markets WHERE id = ?", (market_id,)
             ).fetchone()

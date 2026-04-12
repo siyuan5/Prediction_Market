@@ -11,9 +11,9 @@ Target: Working autonomous trading system for final presentation (~1 month out).
 | Async model | Simulated async — threads in one Python process, not multi-process |
 | Number of markets | Single market at a time, but schema supports `market_id` for future multi-market |
 | Round-based mode | Kept alongside autonomous mode, both paths coexist |
-| Persistence | In-memory SQLite (`sqlite3.connect(":memory:", check_same_thread=False)`), fresh per run |
+| Persistence | SQLite (file-backed or `file::memory:?cache=shared`), WAL mode, shared across threads |
 | HTTP client for agents | `requests` library (sync), not `aiohttp` |
-| Concurrency | **One `threading.Lock` per market** — stored in `MarketDB` as `self._locks[market_id]`. Every write goes through `with self._locks[market_id]:` |
+| Concurrency | **SQLite WAL + `BEGIN IMMEDIATE` + `busy_timeout`** — per-thread connections in `MarketService`, no Python-level locks. Write serialization handled by SQLite's native locking. |
 | CRRA math location | Extract shared helper to `src/crra_math.py` with `compute_optimal_trade(belief, price, cash, shares, rho) -> float`. Both `crra_agent.py` and `autonomous_agent.py` import from it |
 
 ---
@@ -276,47 +276,51 @@ Every task must handle these:
 
 ---
 
-## Task 1 — Persistent Market State Layer
+## Task 1 — Persistent Market State Layer  ✅
 
-**File:** `src/market_db.py`
+**File:** `app/market_store.py`
 
 **Build:**
-- `MarketDB` class with `sqlite3` in-memory connection, `check_same_thread=False`
-- Per-market lock dict: `self._locks: dict[str, threading.Lock] = {}`
-- Schema creation on init (all tables listed in overview)
-- Methods (all thread-safe):
-  - `create_market(mechanism, ground_truth, b, tick_size) -> market_id`
-  - `create_agent(market_id, cash, belief, rho, personality) -> agent_id`
-  - `get_price(market_id) -> dict`
-  - `update_price(market_id, new_price, inventory_update)`
-  - `get_agent(market_id, agent_id) -> dict`
-  - `update_agent_portfolio(market_id, agent_id, cash_delta, shares_delta)`
+- `MarketStore` class with SQLite connection (in-memory or file-backed)
+- Supports `_conn` parameter for external connection injection and `_external_transactions` flag so `MarketService` can manage transactions externally
+- Thread safety provided by SQLite WAL mode + `busy_timeout` + `BEGIN IMMEDIATE` transactions (in the service layer), not per-market Python locks — avoids deadlocks and lock-ordering bugs
+- Schema: `markets` (with `ground_truth`, `mechanism`, `status` lifecycle), `agents`, `positions` (with `belief`, `rho`, `personality`), `trades`, `orders`
+- Methods:
+  - `create_market(slug, title, mechanism, b, ground_truth, ...) -> dict`
+  - `create_agent(name, cash, market_id, belief, rho, personality) -> dict`
+  - `get_price(market_id) -> float`
+  - `get_market(market_id) -> dict`
+  - `get_agent(agent_id, market_id) -> dict`
+  - `update_agent_portfolio(market_id, agent_id, cash_delta, shares_delta) -> dict`
   - `set_agent_belief(market_id, agent_id, new_belief) -> old_belief`
-  - `insert_order(market_id, agent_id, side, quantity, limit_price, order_type) -> order_id`
   - `get_order_book(market_id) -> dict` (bids/asks)
-  - `record_trade(market_id, agent_id, quantity, price) -> trade_id`
   - `get_trades(market_id, since_trade_id=None, limit=100) -> list`
-  - `set_market_status(market_id, status)` where status in {"created", "running", "stopped"}
+  - `set_market_status(market_id, status)` where status in {"created", "open", "running", "stopped"}
+  - `get_position(agent_id, market_id) -> dict`
+  - `submit_trade(agent_id, market_id, side, shares) -> dict` (LMSR)
+  - `submit_limit_order / submit_market_order` (CDA)
+  - `resolve_market(market_id, outcome) -> dict`
 
 **Done when:**
-- `pytest tests/test_market_db.py` passes with cases: create market, insert agents, submit trades concurrently from 10 threads without data corruption, read final state matches expected cash/shares totals
+- `pytest tests/test_market_store.py` passes (51 tests): CRUD, LMSR/CDA trading, multi-market, resolution, status lifecycle, agent belief/portfolio, `since_trade_id` filtering
 
 ---
 
-## Task 2 — Thread-Safe Market Service
+## Task 2 — Thread-Safe Market Service  ✅
 
-**File:** `src/market_service.py`
+**File:** `app/market_service.py`
 
 **Build:**
-- `MarketService` class with dependency on `MarketDB`
-- `execute_lmsr_trade(market_id, agent_id, quantity) -> dict` — atomic under market lock: read price, compute cost, validate agent cash/shares, update agent portfolio, update market inventory, update price, record trade, return result dict
-- `execute_cda_order(market_id, agent_id, side, quantity, limit_price, order_type) -> dict` — atomic: insert order, run matching, execute resulting trades, update both counterparty portfolios, update price (mid or last-trade), return result dict
-- `get_price_snapshot(market_id) -> dict`
-- `get_order_book(market_id) -> dict`
-- Imports CRRA cost logic from existing `team_a_market_logic.py` and order-matching from `team_b_market_logic.py` — does not re-implement
+- `MarketService` class that **depends on `MarketStore`** — creates per-thread `MarketStore` instances wrapping per-thread SQLite connections; delegates all CRUD and query methods to the store instead of re-implementing SQL
+- Per-thread connections configured with WAL mode, `busy_timeout`, and `isolation_level=None` for explicit `BEGIN IMMEDIATE` transactions
+- `execute_lmsr_trade(market_id, agent_id, quantity) -> dict` — atomic under `BEGIN IMMEDIATE`: uses `LMSRMarketMaker` from `team_a_market_logic.py` for cost/price math, clips to affordable quantity when agent has insufficient cash
+- `execute_cda_order(market_id, agent_id, side, quantity, limit_price, order_type) -> dict` — atomic: hydrates `ContinuousDoubleAuction` from `team_b_market_logic.py`, runs matching, persists results with per-trade cash validation
+- `get_price_snapshot(market_id) -> dict` — returns mechanism-specific price info
+- `get_price(market_id) -> float` — uses `LMSRMarketMaker` for LMSR, DB reference price for CDA
+- Backward-compatible wrappers: `execute_trade`, `execute_limit_order`, `execute_market_order`
 
 **Done when:**
-- `pytest tests/test_market_service.py` passes with cases: 10 concurrent `execute_lmsr_trade` calls produce consistent final state, CDA order matching works with crossing orders, clipping works when agent has insufficient cash
+- `pytest tests/test_market_service.py` passes (31 tests): 10 concurrent `execute_lmsr_trade` calls produce consistent final state, CDA order matching works with crossing orders, clipping works when agent has insufficient cash, `get_price_snapshot` returns correct dict
 
 ---
 
@@ -325,7 +329,7 @@ Every task must handle these:
 **File:** `api/main.py` (modify, don't break existing endpoints)
 
 **Build:**
-- Import `MarketService` as a module-level singleton
+- Import `MarketService` from `app/market_service.py` as a module-level singleton
 - Add all endpoints listed in "Locked API Contracts" section above
 - Each endpoint validates input, calls service, returns dict (FastAPI handles JSON)
 - Use Pydantic models for request validation — create `MarketCreateRequest`, `TradeRequest`, `BeliefUpdateRequest` classes
@@ -473,7 +477,7 @@ Three experiments, each exporting CSV + JSON + chart:
 Each developer writes unit tests for the module they own as part of their task. This is not a separate assignment — it's a requirement baked into Tasks 1 through 7.
 
 **Per-task test files:**
-- Task 1 owner → `tests/test_market_db.py`
+- Task 1 owner → `tests/test_market_store.py`
 - Task 2 owner → `tests/test_market_service.py`
 - Task 3 owner → `tests/test_api_endpoints.py`
 - Task 4 owner → `tests/test_autonomous_agent.py` + updates to `tests/test_crra_agent.py` after math extraction
