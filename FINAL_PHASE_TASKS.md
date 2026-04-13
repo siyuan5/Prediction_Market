@@ -331,12 +331,16 @@ Every task must handle these:
 **Build:**
 - Import `MarketService` from `app/market_service.py` as a module-level singleton
 - Add all endpoints listed in "Locked API Contracts" section above
+- Add `GET /api/markets` — list all open markets with current price, agent count, trade count (agents use this to discover which markets to trade on)
+- Add `POST /api/market/{id}/news` — triggers a "news event" that shifts beliefs of a subset of agents toward a new value. This simulates real-world information release. Different from raw belief shock: the endpoint picks which agents "see" the news based on their signal_sensitivity personality trait
 - Each endpoint validates input, calls service, returns dict (FastAPI handles JSON)
-- Use Pydantic models for request validation — create `MarketCreateRequest`, `TradeRequest`, `BeliefUpdateRequest` classes
+- Use Pydantic models for request validation — create `MarketCreateRequest`, `TradeRequest`, `BeliefUpdateRequest`, `NewsEventRequest` classes
 - Response models optional but recommended
 
 **Done when:**
 - Manual curl flow works: create market → query price → submit trade → verify new price reflects trade → query agent state → shift belief → verify new belief
+- `GET /api/markets` returns list of all markets with summary info
+- `POST /api/market/{id}/news` shifts beliefs for sensitive agents and price moves persistently (not just for a few rounds)
 - All existing session endpoints still respond correctly (regression check)
 - `pytest tests/test_api_endpoints.py` covers every new endpoint including error cases
 
@@ -354,24 +358,28 @@ First, extract shared CRRA logic:
 - All existing tests must still pass
 
 Then build the agent:
-- `AutonomousAgent` class with `__init__(agent_id, market_id, api_base_url, personality)`
+- `AutonomousAgent` class with `__init__(agent_id, market_ids, api_base_url, personality)`
+  - Note: `market_ids` is a **list** — agent can trade on multiple markets
 - `self._stop_flag = threading.Event()`
 - `run()` method — loop until stop flag:
   1. Sleep `uniform(mean - jitter, mean + jitter)` seconds
-  2. GET `/market/{id}/price` → extract current price
-  3. GET `/market/{id}/agent/{id}` → extract cash, shares, belief
-  4. Compute `x_star = compute_optimal_trade(belief, price, cash, shares, rho)`
-  5. Apply trade_size_noise: `x_star *= uniform(1 - noise, 1 + noise)`
-  6. If `abs(belief - price) < edge_threshold`, skip
-  7. If `random() > participation_rate`, skip
-  8. POST `/market/{id}/trade` with quantity
-  9. Log result (or error, with retry on 409)
+  2. GET `/api/markets` → see all open markets
+  3. Pick a market to check (round-robin across `market_ids`, or pick the one with biggest edge)
+  4. GET `/market/{id}/price` → extract current price
+  5. GET `/market/{id}/agent/{id}` → extract cash, shares, belief
+  6. Compute `x_star = compute_optimal_trade(belief, price, cash, shares, rho)`
+  7. Apply trade_size_noise: `x_star *= uniform(1 - noise, 1 + noise)`
+  8. If `abs(belief - price) < edge_threshold`, skip
+  9. If `random() > participation_rate`, skip
+  10. POST `/market/{id}/trade` with quantity
+  11. Log result (or error, with retry on 409)
 - `stop()` sets the event flag
 - Use `requests.Session()` for connection reuse
+- Market selection strategy: start simple (round-robin), can be upgraded to edge-based later
 
 **Done when:**
 - `pytest tests/test_autonomous_agent.py` passes with mocked HTTP responses
-- Manual test: start the API server, instantiate one `AutonomousAgent`, run for 10 seconds, observe at least 3 trades in the trade feed
+- Manual test: start the API server with 2 markets, instantiate one `AutonomousAgent` assigned to both, run for 10 seconds, observe trades on both markets
 - `crra_agent.py` tests all still pass after math extraction
 
 ---
@@ -399,42 +407,63 @@ Then build the agent:
 **File:** `src/agent_runner.py`
 
 **Build:**
-- `AgentRunner` class owned by the API layer (one per market)
-- `__init__(market_id, api_base_url, market_db)`
-- `start_all()` — reads all agents from DB, instantiates `AutonomousAgent` for each, spawns daemon thread for each, stores thread handles
-- `stop_all()` — sets stop flags, joins threads with 5-second timeout, force-kills any stuck threads, updates market status in DB
-- `is_running() -> bool`
-- `agent_count_active() -> int`
-- Thread-restart logic: if any agent thread dies unexpectedly, log and restart it (within reason — cap at 3 restarts per agent)
+- `AgentRunner` class owned by the API layer (manages agents across all markets, not just one)
+- `__init__(api_base_url, market_db)`
+- `start_market(market_id)` — reads agents assigned to this market from DB, instantiates `AutonomousAgent` for each (with all their `market_ids`), spawns daemon thread for each, stores thread handles
+- `stop_market(market_id)` — sets stop flags for agents on that market, joins threads with 5-second timeout, updates market status in DB
+- `start_all()` / `stop_all()` — convenience methods across all markets
+- `is_running(market_id) -> bool`
+- `agent_count_active(market_id) -> int`
+- Thread-restart logic: if any agent thread dies unexpectedly, log and restart it (cap at 3 restarts per agent)
 - Wire to `/api/market/{id}/start` and `/stop` endpoints
+- Handles agents that span multiple markets: an agent thread runs as long as any of its markets are active
 
 **Done when:**
-- POST start → 50 agents trade for 30 seconds → POST stop → all threads exit cleanly within timeout
-- `ps` / thread dump shows no zombie threads after stop
+- POST start on 2 markets → 50 agents trade across both for 30 seconds → POST stop on one market → agents on the other keep going → POST stop on second → all threads exit cleanly
+- No zombie threads after stop
 - Killing one agent mid-run triggers a clean restart, final state consistent
 
 ---
 
-## Task 7 — Frontend Autonomous Mode Integration
+## Task 7 — Polymarket-Style Frontend
 
 **Files:** `frontend/src/App.tsx`, new components under `frontend/src/components/`
 
+The frontend should look and feel like a real prediction market platform (Polymarket), not a simulation dashboard. De-emphasize simulation parameters, emphasize the market experience.
+
 **Build:**
-- Top-level toggle: `Round Mode | Autonomous Mode` — hides/shows respective panels
-- Autonomous mode panel components:
-  - `MarketSetup` — form for mechanism, n_agents, ground_truth, personality distribution, "Create Market" button
-  - `MarketControls` — Start/Stop buttons, status indicator, elapsed time, trade count
-  - `LivePriceChart` — polls `/market/{id}/price` every 500ms, appends to a rolling 200-point buffer
-  - `TradeFeed` — polls `/market/{id}/trades?since=<last_id>` every 1s, shows last 20 in a scrollable list
-  - `AgentTable` — polls `/market/{id}/agents` every 2s, shows belief, cash, shares, pnl, sortable columns
-  - `BeliefShiftPanel` — select agent (or "all"), input new belief, POST to the shift endpoint, show confirmation
-- Round mode remains fully functional, no regressions
+
+**Market listing page (home):**
+- Shows all open markets as cards: title, current price, agent count, trade volume
+- "Create Market" button opens a form (mechanism, title, n_agents, ground_truth)
+- Polls `GET /api/markets` every 2s to refresh
+
+**Individual market page (`/market/{id}`):**
+- Market title and current price prominently displayed (e.g. "Will it rain tomorrow? 68% YES")
+- `LivePriceChart` — polls `/market/{id}/price` every 500ms
+- `TradeFeed` — polls `/market/{id}/trades?since=<last_id>` every 1s, shows recent trades with agent name, side, quantity, price
+- `OrderBook` (CDA only) — polls `/market/{id}/book` every 1s, shows bid/ask depth
+- `CommentSection` — LLM-generated trader commentary per market, polls and appends new comments. Carry over existing Ollama integration from `api/llm_comments.py`
+- Start/Stop trading buttons
+- "News Event" button — opens a modal to trigger a news event (`POST /market/{id}/news`), input the new belief target value and what % of agents are affected
+
+**Agent profiles page (`/agents`):**
+- Table of all agents: name/id, belief, rho, cash, shares, PnL, personality traits
+- Sortable columns, click into individual agent to see their trade history
+- Manual belief shift control per agent
+
+**General:**
 - Use `useEffect` + `setInterval` for polling, clean up on unmount
+- Existing round-based mode remains accessible (e.g. under a "Classic Mode" tab) but is not the default
+- Responsive layout
 
 **Done when:**
-- PM can walk through full demo: create market → start → watch live chart and trade feed → shift beliefs for a subset of agents → observe price reaction → stop → see final agent table
-- Round mode still works identically to before
-- No console errors in either mode
+- PM can open the app and it looks like a trading platform, not a simulation tool
+- Full demo flow: create market with a title → start → watch live price and trade feed → trigger a "news event" → see price react → read LLM comments → check agent leaderboard → stop → see final results
+- Multiple markets can be open at the same time, agents trade across them
+- LLM comments appear in each market's comment section
+- Round mode still accessible and functional
+- No console errors
 
 ---
 
@@ -458,12 +487,18 @@ Three experiments, each exporting CSV + JSON + chart:
 - Compare: final error, trade count, price stability (rolling std)
 - Deliverable: 3-column table with mean ± std per metric
 
-**Experiment 3 — Belief Shock Recovery**
+**Experiment 3 — News Event Response**
 - Run autonomous for 30 seconds (baseline period)
-- Shift beliefs of 50% of agents by +0.20
+- Trigger a "news event" that shifts beliefs of ~50% of agents (those with high signal_sensitivity) by +0.20
 - Run another 30 seconds (recovery period)
-- Measure: time for price to move 50% of the way to new mean belief, final error vs new mean belief
-- Deliverable: overlay chart showing pre/post-shock price trajectory
+- Measure: time for price to move 50% of the way to new mean belief, whether shift persists (unlike old round-based shocks that faded in a few rounds)
+- Deliverable: overlay chart showing pre/post-news price trajectory
+
+**Experiment 4 — Multi-Market**
+- Create 2 markets with different ground truths (0.30 and 0.80)
+- Assign agents across both
+- Run for 60 seconds, verify each market converges toward its own ground truth independently
+- Deliverable: side-by-side price charts
 
 **Done when:**
 - All three experiments run end-to-end with one command per experiment
