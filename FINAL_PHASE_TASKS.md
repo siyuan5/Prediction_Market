@@ -9,12 +9,13 @@ Target: Working autonomous trading system for final presentation (~1 month out).
 | Question | Decision |
 |---|---|
 | Async model | Simulated async — threads in one Python process, not multi-process |
-| Number of markets | Single market at a time, but schema supports `market_id` for future multi-market |
+| Number of markets | Multi-market support is first-class (agents can participate in multiple markets concurrently) |
 | Round-based mode | Kept alongside autonomous mode, both paths coexist |
 | Persistence | SQLite (file-backed or `file::memory:?cache=shared`), WAL mode, shared across threads |
 | HTTP client for agents | `requests` library (sync), not `aiohttp` |
 | Concurrency | **SQLite WAL + `BEGIN IMMEDIATE` + `busy_timeout`** — per-thread connections in `MarketService`, no Python-level locks. Write serialization handled by SQLite's native locking. |
 | CRRA math location | Extract shared helper to `src/crra_math.py` with `compute_optimal_trade(belief, price, cash, shares, rho) -> float`. Both `crra_agent.py` and `autonomous_agent.py` import from it |
+| Agent lifecycle | **Decoupled from markets**: agents are created/updated globally, discover open markets, and choose where to trade without forced enrollment |
 
 ---
 
@@ -22,19 +23,79 @@ Target: Working autonomous trading system for final presentation (~1 month out).
 
 Every endpoint returns JSON. Errors return `{"error": "message"}` with appropriate HTTP status.
 
+### POST /api/agents
+
+**Request:**
+```json
+{
+  "name": "agent_007",
+  "cash": 100.0,
+  "belief": 0.62,
+  "rho": 1.0,
+  "personality": { /* see personality schema below */ }
+}
+```
+
+**Response (201):**
+```json
+{
+  "agent_id": 7,
+  "name": "agent_007",
+  "cash": 100.0,
+  "belief": 0.62,
+  "rho": 1.0,
+  "personality": { /* ... */ }
+}
+```
+
+**Errors:** 400 for invalid belief/rho/personality values.
+
+---
+
+### GET /api/agents
+
+**Response (200):**
+```json
+{
+  "agents": [
+    {"agent_id": 7, "name": "agent_007", "cash": 100.0, "belief": 0.62, "rho": 1.0, "personality": { /* ... */ }},
+    {"agent_id": 8, "name": "agent_008", "cash": 120.0, "belief": 0.48, "rho": 0.8, "personality": { /* ... */ }}
+  ],
+  "total": 2
+}
+```
+
+**Query params:** `?limit=100&offset=0`.
+
+---
+
+### PATCH /api/agents/{agent_id}
+
+Updates global agent profile fields (`cash`, `belief`, `rho`, `personality`).
+
+**Request (example):**
+```json
+{
+  "belief": 0.70,
+  "personality": { "edge_threshold": 0.02 }
+}
+```
+
+**Response (200):** Updated agent object.
+
+**Errors:** 404 if agent not found.
+
+---
+
 ### POST /api/market/create
 
 **Request:**
 ```json
 {
   "mechanism": "lmsr",
+  "title": "Will ETH close above $4k by Friday?",
   "ground_truth": 0.70,
-  "n_agents": 50,
-  "initial_cash": 100.0,
-  "b": 100.0,
-  "belief_spec": {"mode": "gaussian", "sigma": 0.10},
-  "rho_distribution": {"min": 0.5, "max": 2.0},
-  "personality_defaults": { /* see personality schema below */ }
+  "b": 100.0
 }
 ```
 
@@ -43,13 +104,39 @@ Every endpoint returns JSON. Errors return `{"error": "message"}` with appropria
 {
   "market_id": "m_abc123",
   "mechanism": "lmsr",
-  "n_agents": 50,
   "initial_price": 0.5,
-  "ground_truth": 0.70
+  "ground_truth": 0.70,
+  "status": "open"
 }
 ```
 
-**Errors:** 400 if mechanism invalid, n_agents < 2, or ground_truth out of [0.01, 0.99].
+**Errors:** 400 if mechanism invalid or ground_truth out of [0.01, 0.99].
+
+---
+
+### GET /api/markets
+
+Returns market discovery feed for autonomous agents and UI.
+
+**Response (200):**
+```json
+{
+  "markets": [
+    {
+      "market_id": "m_abc123",
+      "title": "Will ETH close above $4k by Friday?",
+      "mechanism": "lmsr",
+      "status": "open",
+      "price": 0.6847,
+      "trade_count_24h": 142,
+      "active_agents_24h": 31
+    }
+  ],
+  "total": 1
+}
+```
+
+**Query params:** `?status=open&limit=100&offset=0`.
 
 ---
 
@@ -177,11 +264,13 @@ Exactly one of `new_belief` or `delta` must be provided.
 
 **Errors:** 400 if both or neither field given, or if belief out of [0.01, 0.99]. 404 if not found.
 
+This updates the **global agent belief**. Market positions are created lazily when the agent first trades in a market.
+
 ---
 
 ### GET /api/market/{market_id}/agents
 
-**Response (200):** Array of agent objects (same shape as single-agent endpoint).
+**Response (200):** Array of agents with positions/trades in this market (same shape as single-agent endpoint).
 
 **Query params:** `?limit=50&offset=0` for pagination.
 
@@ -206,7 +295,7 @@ Exactly one of `new_belief` or `delta` must be provided.
 
 ### POST /api/market/{market_id}/start
 
-Starts the autonomous agent runner threads.
+Starts autonomous trading for this market. Global agent threads discover this market via `GET /api/markets` and may choose to trade it.
 
 **Response (200):**
 ```json
@@ -267,6 +356,7 @@ Every task must handle these:
 |---|---|
 | Agent tries to buy more than cash allows | Clip quantity to max affordable, log, execute clipped trade |
 | Agent tries to sell more shares than held | Clip to available shares, log, execute clipped trade |
+| Agent trades a market with no existing position row | Create position lazily on first trade, then apply trade atomically |
 | Trade arrives for a stopped market | Return 409, agent client waits 1s and retries |
 | Concurrent trades on same market | Serialized by market lock, later trade sees updated price |
 | Agent thread crashes | Runner logs exception, restarts that agent after 2s |
@@ -284,12 +374,12 @@ Every task must handle these:
 - `MarketStore` class with SQLite connection (in-memory or file-backed)
 - Supports `_conn` parameter for external connection injection and `_external_transactions` flag so `MarketService` can manage transactions externally
 - Thread safety provided by SQLite WAL mode + `busy_timeout` + `BEGIN IMMEDIATE` transactions (in the service layer), not per-market Python locks — avoids deadlocks and lock-ordering bugs
-- Schema: `markets` (with `ground_truth`, `mechanism`, `status` lifecycle), `agents` (top-level, independent of markets — stores `belief`, `rho`, `cash`, `personality`), `positions` (join table linking agents to markets — stores `shares` per agent per market), `trades`, `orders`
-  - **Key design: agents exist independently from markets.** An agent is created with its own beliefs/personality/cash first, then joins markets. Markets don't create or configure agents.
+- Schema: `markets` (with `ground_truth`, `mechanism`, `status` lifecycle), `agents` (top-level, independent of markets — stores `belief`, `rho`, `cash`, `personality`), `positions` (join table linking agents to markets — stores market-specific holdings), `trades`, `orders`
+  - **Key design: agents exist independently from markets.** An agent is created with its own beliefs/personality/cash first, then autonomously chooses markets. Markets do not create or configure agents.
 - Methods:
   - `create_market(slug, title, mechanism, b, ground_truth, ...) -> dict`
   - `create_agent(name, cash, belief, rho, personality) -> dict` (no market_id — agent is independent)
-  - `join_market(agent_id, market_id) -> dict` (creates a position row linking agent to market)
+  - `ensure_position(agent_id, market_id) -> dict` (lazy-create a position row when first needed)
   - `get_price(market_id) -> float`
   - `get_market(market_id) -> dict`
   - `get_agent(agent_id) -> dict` (agent-level data, not market-specific)
@@ -299,13 +389,13 @@ Every task must handle these:
   - `get_order_book(market_id) -> dict` (bids/asks)
   - `get_trades(market_id, since_trade_id=None, limit=100) -> list`
   - `set_market_status(market_id, status)` where status in {"created", "open", "running", "stopped"}
-  - `get_position(agent_id, market_id) -> dict`
   - `submit_trade(agent_id, market_id, side, shares) -> dict` (LMSR)
   - `submit_limit_order / submit_market_order` (CDA)
   - `resolve_market(market_id, outcome) -> dict`
 
 **Done when:**
-- `pytest tests/test_market_store.py` passes (51 tests): CRUD, LMSR/CDA trading, multi-market, resolution, status lifecycle, agent belief/portfolio, `since_trade_id` filtering
+- `pytest tests/test_market_store.py` passes (expanded): CRUD, LMSR/CDA trading, multi-market, resolution, status lifecycle, lazy position creation, agent belief/portfolio, `since_trade_id` filtering
+- Decoupling invariants hold: creating a market does not create agents; creating an agent does not require a market; one agent can trade multiple markets
 
 ---
 
@@ -316,6 +406,7 @@ Every task must handle these:
 **Build:**
 - `MarketService` class that **depends on `MarketStore`** — creates per-thread `MarketStore` instances wrapping per-thread SQLite connections; delegates all CRUD and query methods to the store instead of re-implementing SQL
 - Per-thread connections configured with WAL mode, `busy_timeout`, and `isolation_level=None` for explicit `BEGIN IMMEDIATE` transactions
+- Add market-discovery helpers (`list_markets_with_summary`) and lazy-position helpers (`ensure_position`) used by trade execution paths
 - `execute_lmsr_trade(market_id, agent_id, quantity) -> dict` — atomic under `BEGIN IMMEDIATE`: uses `LMSRMarketMaker` from `team_a_market_logic.py` for cost/price math, clips to affordable quantity when agent has insufficient cash
 - `execute_cda_order(market_id, agent_id, side, quantity, limit_price, order_type) -> dict` — atomic: hydrates `ContinuousDoubleAuction` from `team_b_market_logic.py`, runs matching, persists results with per-trade cash validation
 - `get_price_snapshot(market_id) -> dict` — returns mechanism-specific price info
@@ -324,29 +415,31 @@ Every task must handle these:
 
 **Done when:**
 - `pytest tests/test_market_service.py` passes (31 tests): 10 concurrent `execute_lmsr_trade` calls produce consistent final state, CDA order matching works with crossing orders, clipping works when agent has insufficient cash, `get_price_snapshot` returns correct dict
+- First trade by an agent in a market auto-creates position state with no separate pre-linking call
 
 ---
 
 ## Task 3 — Agent-Facing API Endpoints
 
-**File:** `api/main.py` (modify, don't break existing endpoints)
+**File:** `api/main.py` (breaking redesign allowed)
 
 **Build:**
 - Import `MarketService` from `app/market_service.py` as a module-level singleton
 - Add all endpoints listed in "Locked API Contracts" section above
-- Add `POST /api/agents/create` — create an agent independently (belief, rho, cash, personality). No market_id required.
-- Add `POST /api/market/{id}/join` — agent joins a market (creates a position)
-- Add `GET /api/markets` — list all open markets with current price, agent count, trade count (agents use this to discover which markets to trade on)
-- Add `POST /api/market/{id}/news` — triggers a "news event" that shifts beliefs of a subset of agents toward a new value. This simulates real-world information release. Different from raw belief shock: the endpoint picks which agents "see" the news based on their signal_sensitivity personality trait
-- `POST /api/market/create` no longer creates agents — it only creates the market itself
+- Market-create endpoints must not accept or infer agent population parameters
+- Add top-level agent lifecycle endpoints: `POST /api/agents`, `GET /api/agents`, `PATCH /api/agents/{agent_id}`
+- Do not add manual assignment endpoints; market participation is agent-driven via market discovery
+- Add `GET /api/markets` — list all markets with current price, active agent count, trade count
+- Keep/extend `POST /api/market/{id}/news` for information shocks to selected active agents
 - Each endpoint validates input, calls service, returns dict (FastAPI handles JSON)
 - Use Pydantic models for request validation — create `AgentCreateRequest`, `MarketCreateRequest`, `TradeRequest`, `BeliefUpdateRequest`, `NewsEventRequest` classes
 - Response models optional but recommended
 
 **Done when:**
-- Manual curl flow works: create agents → create market → agents join market → query price → submit trade → verify new price → shift belief → verify
+- Manual curl flow works: create agents → create market → query markets → submit trade → verify new price → shift belief → verify
 - Agents can be created before any market exists
-- Same agent can join multiple markets
+- Same agent can trade multiple markets
+- Market creation never creates agents or positions
 - `GET /api/markets` returns list of all markets with summary info
 - `POST /api/market/{id}/news` shifts beliefs for sensitive agents and price moves persistently (not just for a few rounds)
 - All existing session endpoints still respond correctly (regression check)
@@ -368,13 +461,13 @@ First, extract shared CRRA logic:
 Then build the agent:
 - `AutonomousAgent` class with `__init__(agent_id, api_base_url, personality, belief, rho, cash)`
   - Agent is created **without any market_id** — it exists independently first
-  - Call `agent.join_market(market_id)` to add markets to trade on (stores as internal list)
-  - Can join multiple markets at any time
+  - Agent discovers open markets via `GET /api/markets` and chooses where to trade
+  - No pre-assignment step
 - `self._stop_flag = threading.Event()`
 - `run()` method — loop until stop flag:
   1. Sleep `uniform(mean - jitter, mean + jitter)` seconds
   2. GET `/api/markets` → see all open markets
-  3. Pick a market to check (round-robin across `market_ids`, or pick the one with biggest edge)
+  3. Score candidate markets and pick one (start with biggest absolute edge `|belief - price|`; fallback random)
   4. GET `/market/{id}/price` → extract current price
   5. GET `/market/{id}/agent/{id}` → extract cash, shares, belief
   6. Compute `x_star = compute_optimal_trade(belief, price, cash, shares, rho)`
@@ -389,7 +482,7 @@ Then build the agent:
 
 **Done when:**
 - `pytest tests/test_autonomous_agent.py` passes with mocked HTTP responses
-- Manual test: start the API server with 2 markets, instantiate one `AutonomousAgent` assigned to both, run for 10 seconds, observe trades on both markets
+- Manual test: start the API server with 2 open markets, run one `AutonomousAgent` for 10 seconds, observe it independently trade both markets
 - `crra_agent.py` tests all still pass after math extraction
 
 ---
@@ -403,7 +496,7 @@ Then build the agent:
 - `sample_personality(distribution_config, rng) -> Personality` — samples each field from its configured distribution
 - `DEFAULT_POPULATION_DIST` constant matching the spec above
 - Wire `AutonomousAgent.run()` to use all personality fields (steps 1, 5, 6, 7 above)
-- At market creation time in Task 3, each agent gets a sampled personality stored in DB
+- At **agent creation time** in Task 3, each agent gets a sampled personality stored in DB (or explicitly supplied)
 
 **Done when:**
 - Two agents with identical beliefs/cash/rho but different personalities demonstrably trade differently in a 30-second run (different trade counts, different average trade sizes)
@@ -419,14 +512,14 @@ Then build the agent:
 **Build:**
 - `AgentRunner` class owned by the API layer (manages agents across all markets, not just one)
 - `__init__(api_base_url, market_db)`
-- `start_market(market_id)` — reads agents assigned to this market from DB, instantiates `AutonomousAgent` for each (with all their `market_ids`), spawns daemon thread for each, stores thread handles
-- `stop_market(market_id)` — sets stop flags for agents on that market, joins threads with 5-second timeout, updates market status in DB
+- `start_market(market_id)` — marks market active/open for autonomous trading and ensures global agent threads can discover it
+- `stop_market(market_id)` — marks market stopped so agents skip it on next discovery cycle; updates market status in DB
 - `start_all()` / `stop_all()` — convenience methods across all markets
 - `is_running(market_id) -> bool`
 - `agent_count_active(market_id) -> int`
 - Thread-restart logic: if any agent thread dies unexpectedly, log and restart it (cap at 3 restarts per agent)
 - Wire to `/api/market/{id}/start` and `/stop` endpoints
-- Handles agents that span multiple markets: an agent thread runs as long as any of its markets are active
+- Agents self-select markets each cycle; no market-to-agent assignment table is required
 
 **Done when:**
 - POST start on 2 markets → 50 agents trade across both for 30 seconds → POST stop on one market → agents on the other keep going → POST stop on second → all threads exit cleanly
@@ -445,7 +538,7 @@ The frontend should look and feel like a real prediction market platform (Polyma
 
 **Market listing page (home):**
 - Shows all open markets as cards: title, current price, agent count, trade volume
-- "Create Market" button opens a form (mechanism, title, n_agents, ground_truth)
+- "Create Market" button opens a market-only form (mechanism, title, ground_truth, liquidity params)
 - Polls `GET /api/markets` every 2s to refresh
 
 **Individual market page (`/market/{id}`):**
@@ -462,6 +555,11 @@ The frontend should look and feel like a real prediction market platform (Polyma
 - Sortable columns, click into individual agent to see their trade history
 - Manual belief shift control per agent
 
+**Agent autonomy behavior (required):**
+- No enroll/assign panel in the UI
+- Show market discovery as automatic: when a market is open/running, autonomous agents can choose it
+- Start button is not gated by manual assignment
+
 **General:**
 - Use `useEffect` + `setInterval` for polling, clean up on unmount
 - Existing round-based mode remains accessible (e.g. under a "Classic Mode" tab) but is not the default
@@ -469,7 +567,7 @@ The frontend should look and feel like a real prediction market platform (Polyma
 
 **Done when:**
 - PM can open the app and it looks like a trading platform, not a simulation tool
-- Full demo flow: create market with a title → start → watch live price and trade feed → trigger a "news event" → see price react → read LLM comments → check agent leaderboard → stop → see final results
+- Full demo flow: create market with a title → start → autonomous agents discover and trade it → watch live price and trade feed → trigger a "news event" → see price react → read LLM comments → check agent leaderboard → stop → see final results
 - Multiple markets can be open at the same time, agents trade across them
 - LLM comments appear in each market's comment section
 - Round mode still accessible and functional
@@ -483,10 +581,10 @@ The frontend should look and feel like a real prediction market platform (Polyma
 
 **Build:**
 
-Three experiments, each exporting CSV + JSON + chart:
+Four experiments, each exporting CSV + JSON + chart:
 
 **Experiment 1 — Autonomous vs Round-Based Convergence**
-- Same seed, same n_agents (50), same ground_truth (0.70), same belief_spec (gaussian, σ=0.1)
+- Same seed, same active global agent pool size (50), same ground_truth (0.70), same belief distribution
 - Run autonomous for 60 seconds, run round-based for 100 rounds
 - Compare: final price, final error, trajectory shape
 - Success criterion: autonomous converges within 0.05 of round-based final price
@@ -506,12 +604,12 @@ Three experiments, each exporting CSV + JSON + chart:
 
 **Experiment 4 — Multi-Market**
 - Create 2 markets with different ground truths (0.30 and 0.80)
-- Assign agents across both
+- Let the same global agent pool discover and choose across both
 - Run for 60 seconds, verify each market converges toward its own ground truth independently
 - Deliverable: side-by-side price charts
 
 **Done when:**
-- All three experiments run end-to-end with one command per experiment
+- All four experiments run end-to-end with one command per experiment
 - Output artifacts exist in `outputs/autonomous/` (CSVs, JSON, matplotlib PNGs)
 - Summary table ready to drop into the final deliverable and slides
 
@@ -542,7 +640,8 @@ Each developer writes unit tests for the module they own as part of their task. 
 
 **Build:**
 - Full-stack integration tests that spin up the API server, create a market, run autonomous agents, verify state consistency end to end
-- Belief shock integration test: start market, run 10 seconds, inject shift, run another 10 seconds, assert price moved toward new belief mean
+- Decoupling invariant test: create market, assert no agents/positions are auto-created
+- Belief shock integration test: start market, run 10 seconds, inject news/shift, run another 10 seconds, assert price moved toward new belief mean
 - Concurrency stress test: 50 agents running for 30 seconds, assert no data corruption, no crashed threads, total trade count matches DB record count
 - Regression test sweep: run the full existing pytest suite after the refactor is complete and confirm nothing broke
 - Round-based vs autonomous parity check: same seed, same config, assert final prices are within tolerance of each other
