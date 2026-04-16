@@ -109,6 +109,50 @@ class MarketService:
     def list_markets(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         return self._get_store().list_markets(status)
 
+    def list_markets_with_summary(
+        self,
+        status: Optional[str] = None,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Market-discovery helper for API/UI.
+
+        Returns paged market rows with current price, total trade count, and
+        active agents (distinct traders) derived from persisted trade history.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        all_markets = self._get_store().list_markets(status)
+        total = len(all_markets)
+        page = all_markets[offset : offset + limit]
+        out: List[Dict[str, Any]] = []
+        store = self._get_store()
+        for m in page:
+            mid = int(m["id"])
+            row = store.conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS trade_count,
+                    COUNT(DISTINCT agent_id) AS active_agents
+                FROM trades
+                WHERE market_id = ?
+                """,
+                (mid,),
+            ).fetchone()
+            out.append(
+                {
+                    **m,
+                    "price": self.get_price(mid),
+                    "trade_count": int(row["trade_count"] if row else 0),
+                    "active_agents": int(row["active_agents"] if row else 0),
+                }
+            )
+        return {"markets": out, "total": total}
+
     def get_agent(self, agent_id: int, market_id: Optional[int] = None) -> Dict[str, Any]:
         agent = self._get_store().get_agent(agent_id)
         if market_id is not None:
@@ -200,6 +244,11 @@ class MarketService:
                 market_id, agent_id, cash_delta, shares_delta,
             )
 
+    def ensure_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
+        """Lazy-position helper used by trade execution paths."""
+        with self._begin_immediate():
+            return self._get_store().ensure_position(agent_id, market_id)
+
     def resolve_market(self, market_id: int, outcome: str) -> Dict[str, Any]:
         with self._begin_immediate():
             return self._get_store().resolve_market(market_id, outcome)
@@ -276,6 +325,8 @@ class MarketService:
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
+            # Explicit lazy-link helper per Task 2; safe under active tx.
+            store.ensure_position(agent_id, market_id)
 
             b = mkt["b"]
             inv_yes, inv_no = float(mkt["inv_yes"]), float(mkt["inv_no"])
@@ -428,6 +479,8 @@ class MarketService:
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
+            # Ensure the aggressor has a position row before matching/writes.
+            store.ensure_position(agent_id, market_id)
 
             price_before = store._cda_reference_price(market_id)
 
@@ -469,6 +522,8 @@ class MarketService:
                     "UPDATE agents SET cash = cash + ? WHERE id = ?",
                     (notional, trade.seller_id),
                 )
+                store.ensure_position(trade.buyer_id, market_id)
+                store.ensure_position(trade.seller_id, market_id)
                 conn.execute(
                     "INSERT INTO positions (agent_id, market_id, yes_shares) "
                     "VALUES (?, ?, ?) ON CONFLICT(agent_id, market_id) "

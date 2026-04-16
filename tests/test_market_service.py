@@ -132,6 +132,40 @@ class TestSingleThread:
         with pytest.raises(ValueError, match="trading requires"):
             svc.execute_trade(agent["id"], mkt["id"], "buy_yes", shares=1.0)
 
+    def test_first_trade_auto_creates_position_row(self, svc: MarketService):
+        mkt = _make_open_lmsr(svc, slug="lazy-pos")
+        agent = svc.create_agent(name="alice", cash=1000.0, belief=0.6)
+        row0 = svc._get_store().conn.execute(
+            "SELECT COUNT(*) AS c FROM positions WHERE agent_id = ? AND market_id = ?",
+            (agent["id"], mkt["id"]),
+        ).fetchone()
+        assert int(row0["c"]) == 0
+
+        svc.execute_trade(agent["id"], mkt["id"], "buy_yes", shares=1.0)
+        row1 = svc._get_store().conn.execute(
+            "SELECT COUNT(*) AS c FROM positions WHERE agent_id = ? AND market_id = ?",
+            (agent["id"], mkt["id"]),
+        ).fetchone()
+        assert int(row1["c"]) == 1
+
+    def test_list_markets_with_summary(self, svc: MarketService):
+        m1 = _make_open_lmsr(svc, slug="m1")
+        m2 = _make_open_lmsr(svc, slug="m2")
+        a1 = svc.create_agent(name="a1", cash=1000.0)
+        a2 = svc.create_agent(name="a2", cash=1000.0)
+        svc.execute_trade(a1["id"], m1["id"], "buy_yes", shares=1.0)
+        svc.execute_trade(a2["id"], m1["id"], "buy_yes", shares=1.0)
+        svc.execute_trade(a1["id"], m2["id"], "buy_yes", shares=1.0)
+
+        summary = svc.list_markets_with_summary(status="open")
+        assert summary["total"] == 2
+        by_id = {m["id"]: m for m in summary["markets"]}
+        assert by_id[m1["id"]]["trade_count"] == 2
+        assert by_id[m1["id"]]["active_agents"] == 2
+        assert by_id[m2["id"]]["trade_count"] == 1
+        assert by_id[m2["id"]]["active_agents"] == 1
+        assert "price" in by_id[m1["id"]]
+
 
 # ── execute_lmsr_trade (new API) ──────────────────────────────────────
 

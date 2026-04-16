@@ -414,7 +414,7 @@ Every task must handle these:
 - Backward-compatible wrappers: `execute_trade`, `execute_limit_order`, `execute_market_order`
 
 **Done when:**
-- `pytest tests/test_market_service.py` passes (31 tests): 10 concurrent `execute_lmsr_trade` calls produce consistent final state, CDA order matching works with crossing orders, clipping works when agent has insufficient cash, `get_price_snapshot` returns correct dict
+- `pytest tests/test_market_service.py` passes (33 tests): 10 concurrent `execute_lmsr_trade` calls produce consistent final state, CDA order matching works with crossing orders, clipping works when agent has insufficient cash, `get_price_snapshot` returns correct dict
 - First trade by an agent in a market auto-creates position state with no separate pre-linking call
 
 ---
