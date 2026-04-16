@@ -168,39 +168,44 @@ class TestAgentCRUD:
         assert agent["name"] == "alice"
         assert agent["cash"] == 1000.0
 
-    def test_create_agent_with_market(self, store: MarketStore):
+    def test_create_agent_with_market_position_created_lazily(self, store: MarketStore):
         mkt = store.create_market(slug="t", title="T", mechanism="lmsr", b=100.0)
         agent = store.create_agent(
-            name="alice", cash=1000.0, market_id=mkt["id"],
+            name="alice", cash=1000.0,
             belief=0.6, rho=1.5, personality="aggressive",
         )
         assert agent["belief"] == 0.6
         assert agent["rho"] == 1.5
         assert agent["personality"] == "aggressive"
 
+        store.ensure_position(agent["id"], mkt["id"])
         pos = store.get_position(agent["id"], mkt["id"])
         assert pos["belief"] == 0.6
         assert pos["rho"] == 1.5
         assert pos["personality"] == "aggressive"
         assert pos["yes_shares"] == 0.0
 
-    def test_get_agent_with_market(self, store: MarketStore):
+    def test_get_agent_is_global(self, store: MarketStore):
         mkt = store.create_market(slug="t", title="T", mechanism="lmsr", b=100.0)
         agent = store.create_agent(
-            name="bob", cash=500.0, market_id=mkt["id"],
+            name="bob", cash=500.0,
             belief=0.3, rho=2.0, personality="cautious",
         )
-        fetched = store.get_agent(agent["id"], market_id=mkt["id"])
+        fetched = store.get_agent(agent["id"])
         assert fetched["cash"] == 500.0
         assert fetched["belief"] == 0.3
         assert fetched["rho"] == 2.0
         assert fetched["personality"] == "cautious"
-        assert fetched["yes_shares"] == 0.0
+        store.ensure_position(agent["id"], mkt["id"])
+        assert store.get_position(agent["id"], mkt["id"])["yes_shares"] == pytest.approx(0.0)
 
     def test_get_agent_without_market(self, store: MarketStore):
         agent = store.create_agent(name="alice", cash=1000.0)
         fetched = store.get_agent(agent["id"])
-        assert "belief" not in fetched
+        assert "belief" in fetched
+        assert fetched["belief"] is None
+        assert fetched["rho"] is None
+        assert fetched["personality"] is None
 
     def test_duplicate_name_rejected(self, store: MarketStore):
         store.create_agent(name="alice", cash=100.0)
@@ -219,19 +224,37 @@ class TestAgentBelief:
     def test_set_belief(self, store: MarketStore):
         mkt = store.create_market(slug="t", title="T", mechanism="lmsr", b=100.0)
         agent = store.create_agent(
-            name="alice", cash=1000.0, market_id=mkt["id"], belief=0.5,
+            name="alice", cash=1000.0, belief=0.5,
         )
-        old = store.set_agent_belief(mkt["id"], agent["id"], 0.8)
+        old = store.set_agent_belief(agent["id"], 0.8)
         assert old == 0.5
 
+        store.ensure_position(agent["id"], mkt["id"])
         pos = store.get_position(agent["id"], mkt["id"])
         assert pos["belief"] == 0.8
 
-    def test_set_belief_no_position_raises(self, store: MarketStore):
+    def test_set_belief_no_position_still_updates_global_agent(self, store: MarketStore):
         mkt = store.create_market(slug="t", title="T", mechanism="lmsr", b=100.0)
         agent = store.create_agent(name="alice", cash=1000.0)
-        with pytest.raises(ValueError, match="No position"):
-            store.set_agent_belief(mkt["id"], agent["id"], 0.8)
+        old = store.set_agent_belief(agent["id"], 0.8)
+        assert old is None
+        assert store.get_agent(agent["id"])["belief"] == pytest.approx(0.8)
+        # Belief is global and visible from market-scoped reads as well.
+        assert store.get_position(agent["id"], mkt["id"])["belief"] == pytest.approx(0.8)
+
+
+class TestPositionLinking:
+    def test_ensure_position_creates_row(self, store: MarketStore):
+        mkt = store.create_market(slug="t", title="T", mechanism="lmsr", b=100.0)
+        agent = store.create_agent(name="alice", cash=1000.0, belief=0.6, rho=1.2)
+        pos0 = store.get_position(agent["id"], mkt["id"])
+        assert pos0["yes_shares"] == pytest.approx(0.0)
+
+        store.ensure_position(agent["id"], mkt["id"])
+        pos1 = store.get_position(agent["id"], mkt["id"])
+        assert pos1["yes_shares"] == pytest.approx(0.0)
+        assert pos1["belief"] == pytest.approx(0.6)
+        assert pos1["rho"] == pytest.approx(1.2)
 
 
 # ── Agent portfolio update ─────────────────────────────────────────────
@@ -459,19 +482,19 @@ class TestFullLifecycle:
         store.set_market_status(mkt["id"], "running")
 
         agent = store.create_agent(
-            name="alice", cash=1000.0, market_id=mkt["id"],
+            name="alice", cash=1000.0,
             belief=0.6, rho=1.0, personality="moderate",
         )
 
         trade = store.submit_trade(agent["id"], mkt["id"], "buy_yes", shares=10.0)
         assert trade["price_after"] > 0.5
 
-        old_belief = store.set_agent_belief(mkt["id"], agent["id"], 0.9)
+        old_belief = store.set_agent_belief(agent["id"], 0.9)
         assert old_belief == 0.6
 
-        agent_state = store.get_agent(agent["id"], market_id=mkt["id"])
+        agent_state = store.get_agent(agent["id"])
         assert agent_state["belief"] == 0.9
-        assert agent_state["yes_shares"] == pytest.approx(10.0)
+        assert store.get_position(agent["id"], mkt["id"])["yes_shares"] == pytest.approx(10.0)
 
     def test_cda_lifecycle(self, store: MarketStore):
         mkt = store.create_market(
@@ -481,7 +504,7 @@ class TestFullLifecycle:
         store.set_market_status(mkt["id"], "open")
 
         alice = store.create_agent(
-            name="alice", cash=1000.0, market_id=mkt["id"],
+            name="alice", cash=1000.0,
             belief=0.3, rho=2.0, personality="cautious",
         )
         bob = store.create_agent(name="bob", cash=1000.0)

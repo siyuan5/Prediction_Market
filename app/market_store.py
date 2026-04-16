@@ -14,9 +14,13 @@ Usage:
 
     mkt   = store.create_market("btc-100k", "BTC > $100k?",
                                 mechanism="lmsr", b=100.0, ground_truth=0.7)
-    agent = store.create_agent("alice", cash=1000.0,
-                               market_id=mkt["id"], belief=0.6, rho=1.0,
-                               personality="aggressive")
+    agent = store.create_agent(
+        "alice",
+        cash=1000.0,
+        belief=0.6,
+        rho=1.0,
+        personality="aggressive",
+    )
     store.set_market_status(mkt["id"], "running")
     trade = store.submit_trade(agent["id"], mkt["id"], "buy_yes", shares=10.0)
 """
@@ -55,20 +59,20 @@ CREATE TABLE IF NOT EXISTS markets (
 );
 
 CREATE TABLE IF NOT EXISTS agents (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT    UNIQUE NOT NULL,
-    cash       REAL    NOT NULL,
-    created_at TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS positions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id    INTEGER NOT NULL REFERENCES agents(id),
-    market_id   INTEGER NOT NULL REFERENCES markets(id),
-    yes_shares  REAL    NOT NULL DEFAULT 0.0,
+    name        TEXT    UNIQUE NOT NULL,
+    cash        REAL    NOT NULL,
     belief      REAL,
     rho         REAL,
     personality TEXT,
+    created_at  TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   INTEGER NOT NULL REFERENCES agents(id),
+    market_id  INTEGER NOT NULL REFERENCES markets(id),
+    yes_shares REAL    NOT NULL DEFAULT 0.0,
     UNIQUE(agent_id, market_id)
 );
 
@@ -125,6 +129,25 @@ class MarketStore:
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.executescript(_SCHEMA)
             self._owns_conn = True
+        self._migrate_agents_schema()
+
+    def _migrate_agents_schema(self) -> None:
+        """
+        Ensure the agents table has global profile columns.
+
+        Older databases may only have (id, name, cash, created_at). We keep this
+        migration local and idempotent so Task 1 can run against existing files.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(agents)").fetchall()
+        }
+        if "belief" not in cols:
+            self.conn.execute("ALTER TABLE agents ADD COLUMN belief REAL")
+        if "rho" not in cols:
+            self.conn.execute("ALTER TABLE agents ADD COLUMN rho REAL")
+        if "personality" not in cols:
+            self.conn.execute("ALTER TABLE agents ADD COLUMN personality TEXT")
 
     def close(self) -> None:
         if self._owns_conn:
@@ -345,7 +368,6 @@ class MarketStore:
         name: str,
         cash: float,
         *,
-        market_id: Optional[int] = None,
         belief: Optional[float] = None,
         rho: Optional[float] = None,
         personality: Optional[str] = None,
@@ -353,62 +375,33 @@ class MarketStore:
         now = datetime.now(timezone.utc).isoformat()
         with self._transaction():
             cur = self.conn.execute(
-                "INSERT INTO agents (name, cash, created_at) VALUES (?, ?, ?)",
-                (name, cash, now),
+                "INSERT INTO agents (name, cash, belief, rho, personality, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, cash, belief, rho, personality, now),
             )
             agent_id = cur.lastrowid
-            if market_id is not None:
-                self.conn.execute(
-                    "INSERT INTO positions "
-                    "(agent_id, market_id, yes_shares, belief, rho, personality) "
-                    "VALUES (?, ?, 0.0, ?, ?, ?)",
-                    (agent_id, market_id, belief, rho, personality),
-                )
         row = self.conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
-        result = self._agent_row_to_dict(row)
-        if market_id is not None:
-            result.update({"belief": belief, "rho": rho, "personality": personality})
-        return result
+        return self._agent_row_to_dict(row)
 
-    def get_agent(self, agent_id: int, market_id: Optional[int] = None) -> Dict[str, Any]:
+    def get_agent(self, agent_id: int) -> Dict[str, Any]:
         row = self.conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
         if row is None:
             raise ValueError(f"Agent {agent_id} not found")
-        result = self._agent_row_to_dict(row)
-        if market_id is not None:
-            pos = self.conn.execute(
-                "SELECT * FROM positions WHERE agent_id = ? AND market_id = ?",
-                (agent_id, market_id),
-            ).fetchone()
-            if pos is not None:
-                result["yes_shares"] = pos["yes_shares"]
-                result["belief"] = pos["belief"]
-                result["rho"] = pos["rho"]
-                result["personality"] = pos["personality"]
-            else:
-                result["yes_shares"] = 0.0
-                result["belief"] = None
-                result["rho"] = None
-                result["personality"] = None
-        return result
+        return self._agent_row_to_dict(row)
 
-    def set_agent_belief(
-        self, market_id: int, agent_id: int, new_belief: float
-    ) -> float:
-        """Update agent's belief for a market. Returns the old belief."""
+    def set_agent_belief(self, agent_id: int, new_belief: float) -> float:
+        """Update global agent belief and return the previous value."""
         with self._transaction():
             row = self.conn.execute(
-                "SELECT belief FROM positions WHERE agent_id = ? AND market_id = ?",
-                (agent_id, market_id),
+                "SELECT belief FROM agents WHERE id = ?",
+                (agent_id,),
             ).fetchone()
             if row is None:
-                raise ValueError(
-                    f"No position for agent {agent_id} in market {market_id}"
-                )
+                raise ValueError(f"Agent {agent_id} not found")
             old_belief = row["belief"]
             self.conn.execute(
-                "UPDATE positions SET belief = ? WHERE agent_id = ? AND market_id = ?",
-                (new_belief, agent_id, market_id),
+                "UPDATE agents SET belief = ? WHERE id = ?",
+                (new_belief, agent_id),
             )
         return old_belief
 
@@ -444,7 +437,34 @@ class MarketStore:
 
     # ── Positions ──────────────────────────────────────────────────────
 
+    def ensure_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
+        """Lazy-create an agent/market position row if it doesn't exist."""
+        with self._transaction():
+            agent = self.conn.execute(
+                "SELECT id FROM agents WHERE id = ?",
+                (agent_id,),
+            ).fetchone()
+            if agent is None:
+                raise ValueError(f"Agent {agent_id} not found")
+            market = self.conn.execute(
+                "SELECT id FROM markets WHERE id = ?",
+                (market_id,),
+            ).fetchone()
+            if market is None:
+                raise ValueError(f"Market {market_id} not found")
+            self.conn.execute(
+                "INSERT INTO positions (agent_id, market_id, yes_shares) "
+                "VALUES (?, ?, 0.0) "
+                "ON CONFLICT(agent_id, market_id) DO NOTHING",
+                (agent_id, market_id),
+            )
+        return self.get_position(agent_id, market_id)
+
     def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
+        agent = self.conn.execute(
+            "SELECT belief, rho, personality FROM agents WHERE id = ?",
+            (agent_id,),
+        ).fetchone()
         row = self.conn.execute(
             "SELECT * FROM positions WHERE agent_id = ? AND market_id = ?",
             (agent_id, market_id),
@@ -452,15 +472,18 @@ class MarketStore:
         if row is None:
             return {
                 "agent_id": agent_id, "market_id": market_id,
-                "yes_shares": 0.0, "belief": None, "rho": None, "personality": None,
+                "yes_shares": 0.0,
+                "belief": agent["belief"] if agent is not None else None,
+                "rho": agent["rho"] if agent is not None else None,
+                "personality": agent["personality"] if agent is not None else None,
             }
         return {
             "agent_id": row["agent_id"],
             "market_id": row["market_id"],
             "yes_shares": row["yes_shares"],
-            "belief": row["belief"],
-            "rho": row["rho"],
-            "personality": row["personality"],
+            "belief": agent["belief"] if agent is not None else None,
+            "rho": agent["rho"] if agent is not None else None,
+            "personality": agent["personality"] if agent is not None else None,
         }
 
     # ── LMSR Trading ──────────────────────────────────────────────────
@@ -797,5 +820,8 @@ class MarketStore:
             "id": row["id"],
             "name": row["name"],
             "cash": row["cash"],
+            "belief": row["belief"],
+            "rho": row["rho"],
+            "personality": row["personality"],
             "created_at": row["created_at"],
         }

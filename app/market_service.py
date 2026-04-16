@@ -110,7 +110,11 @@ class MarketService:
         return self._get_store().list_markets(status)
 
     def get_agent(self, agent_id: int, market_id: Optional[int] = None) -> Dict[str, Any]:
-        return self._get_store().get_agent(agent_id, market_id)
+        agent = self._get_store().get_agent(agent_id)
+        if market_id is not None:
+            pos = self._get_store().get_position(agent_id, market_id)
+            agent["yes_shares"] = pos["yes_shares"]
+        return agent
 
     def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
         return self._get_store().get_position(agent_id, market_id)
@@ -138,8 +142,8 @@ class MarketService:
         store = self._get_store()
         rows = store.conn.execute(
             """
-            SELECT a.id AS agent_id, a.name, a.cash,
-                   p.yes_shares, p.belief, p.rho, p.personality
+            SELECT a.id AS agent_id, a.name, a.cash, a.belief, a.rho, a.personality,
+                   p.yes_shares
             FROM positions p
             JOIN agents a ON a.id = p.agent_id
             WHERE p.market_id = ?
@@ -172,10 +176,13 @@ class MarketService:
         personality: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self._begin_immediate():
-            return self._get_store().create_agent(
-                name, cash, market_id=market_id, belief=belief,
+            agent = self._get_store().create_agent(
+                name, cash, belief=belief,
                 rho=rho, personality=personality,
             )
+            if market_id is not None:
+                self._get_store().ensure_position(agent["id"], market_id)
+            return agent
 
     def set_market_status(self, market_id: int, status: str) -> Dict[str, Any]:
         with self._begin_immediate():
@@ -183,7 +190,7 @@ class MarketService:
 
     def set_agent_belief(self, market_id: int, agent_id: int, new_belief: float) -> float:
         with self._begin_immediate():
-            return self._get_store().set_agent_belief(market_id, agent_id, new_belief)
+            return self._get_store().set_agent_belief(agent_id, new_belief)
 
     def update_agent_portfolio(
         self, market_id: int, agent_id: int, cash_delta: float, shares_delta: float,
