@@ -284,15 +284,18 @@ Every task must handle these:
 - `MarketStore` class with SQLite connection (in-memory or file-backed)
 - Supports `_conn` parameter for external connection injection and `_external_transactions` flag so `MarketService` can manage transactions externally
 - Thread safety provided by SQLite WAL mode + `busy_timeout` + `BEGIN IMMEDIATE` transactions (in the service layer), not per-market Python locks — avoids deadlocks and lock-ordering bugs
-- Schema: `markets` (with `ground_truth`, `mechanism`, `status` lifecycle), `agents`, `positions` (with `belief`, `rho`, `personality`), `trades`, `orders`
+- Schema: `markets` (with `ground_truth`, `mechanism`, `status` lifecycle), `agents` (top-level, independent of markets — stores `belief`, `rho`, `cash`, `personality`), `positions` (join table linking agents to markets — stores `shares` per agent per market), `trades`, `orders`
+  - **Key design: agents exist independently from markets.** An agent is created with its own beliefs/personality/cash first, then joins markets. Markets don't create or configure agents.
 - Methods:
   - `create_market(slug, title, mechanism, b, ground_truth, ...) -> dict`
-  - `create_agent(name, cash, market_id, belief, rho, personality) -> dict`
+  - `create_agent(name, cash, belief, rho, personality) -> dict` (no market_id — agent is independent)
+  - `join_market(agent_id, market_id) -> dict` (creates a position row linking agent to market)
   - `get_price(market_id) -> float`
   - `get_market(market_id) -> dict`
-  - `get_agent(agent_id, market_id) -> dict`
+  - `get_agent(agent_id) -> dict` (agent-level data, not market-specific)
+  - `get_position(agent_id, market_id) -> dict` (market-specific shares)
   - `update_agent_portfolio(market_id, agent_id, cash_delta, shares_delta) -> dict`
-  - `set_agent_belief(market_id, agent_id, new_belief) -> old_belief`
+  - `set_agent_belief(agent_id, new_belief) -> old_belief` (belief is agent-level, not per-market)
   - `get_order_book(market_id) -> dict` (bids/asks)
   - `get_trades(market_id, since_trade_id=None, limit=100) -> list`
   - `set_market_status(market_id, status)` where status in {"created", "open", "running", "stopped"}
@@ -331,14 +334,19 @@ Every task must handle these:
 **Build:**
 - Import `MarketService` from `app/market_service.py` as a module-level singleton
 - Add all endpoints listed in "Locked API Contracts" section above
+- Add `POST /api/agents/create` — create an agent independently (belief, rho, cash, personality). No market_id required.
+- Add `POST /api/market/{id}/join` — agent joins a market (creates a position)
 - Add `GET /api/markets` — list all open markets with current price, agent count, trade count (agents use this to discover which markets to trade on)
 - Add `POST /api/market/{id}/news` — triggers a "news event" that shifts beliefs of a subset of agents toward a new value. This simulates real-world information release. Different from raw belief shock: the endpoint picks which agents "see" the news based on their signal_sensitivity personality trait
+- `POST /api/market/create` no longer creates agents — it only creates the market itself
 - Each endpoint validates input, calls service, returns dict (FastAPI handles JSON)
-- Use Pydantic models for request validation — create `MarketCreateRequest`, `TradeRequest`, `BeliefUpdateRequest`, `NewsEventRequest` classes
+- Use Pydantic models for request validation — create `AgentCreateRequest`, `MarketCreateRequest`, `TradeRequest`, `BeliefUpdateRequest`, `NewsEventRequest` classes
 - Response models optional but recommended
 
 **Done when:**
-- Manual curl flow works: create market → query price → submit trade → verify new price reflects trade → query agent state → shift belief → verify new belief
+- Manual curl flow works: create agents → create market → agents join market → query price → submit trade → verify new price → shift belief → verify
+- Agents can be created before any market exists
+- Same agent can join multiple markets
 - `GET /api/markets` returns list of all markets with summary info
 - `POST /api/market/{id}/news` shifts beliefs for sensitive agents and price moves persistently (not just for a few rounds)
 - All existing session endpoints still respond correctly (regression check)
@@ -358,8 +366,10 @@ First, extract shared CRRA logic:
 - All existing tests must still pass
 
 Then build the agent:
-- `AutonomousAgent` class with `__init__(agent_id, market_ids, api_base_url, personality)`
-  - Note: `market_ids` is a **list** — agent can trade on multiple markets
+- `AutonomousAgent` class with `__init__(agent_id, api_base_url, personality, belief, rho, cash)`
+  - Agent is created **without any market_id** — it exists independently first
+  - Call `agent.join_market(market_id)` to add markets to trade on (stores as internal list)
+  - Can join multiple markets at any time
 - `self._stop_flag = threading.Event()`
 - `run()` method — loop until stop flag:
   1. Sleep `uniform(mean - jitter, mean + jitter)` seconds
