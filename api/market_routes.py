@@ -491,9 +491,11 @@ def start_autonomous(market_id: int) -> Dict[str, Any]:
                 pmap = None
         ag = AutonomousAgent(
             agent_id=aid,
-            market_id=str(market_id),
             api_base_url=base,
             personality=pmap,
+            belief=float(r.get("belief") or 0.5),
+            rho=float(r.get("rho") or 1.0),
+            cash=float(r.get("cash") or 0.0),
         )
         th = threading.Thread(target=_run_autonomous_loop, args=(ag,), daemon=True)
         th.start()

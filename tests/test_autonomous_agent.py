@@ -30,8 +30,10 @@ class FakeRng:
 def test_run_cycle_submits_trade_when_edge_is_large():
     agent = AutonomousAgent(
         agent_id=7,
-        market_id="m1",
         api_base_url="http://127.0.0.1:8000/api",
+        belief=0.80,
+        rho=1.0,
+        cash=100.0,
         personality={
             "edge_threshold": 0.03,
             "participation_rate": 1.0,
@@ -42,6 +44,14 @@ def test_run_cycle_submits_trade_when_edge_is_large():
 
     submitted = {}
     responses = [
+        FakeResponse(
+            payload={
+                "markets": [
+                    {"id": 1, "price": 0.40},
+                    {"id": 2, "price": 0.72},
+                ]
+            }
+        ),
         FakeResponse(payload={"price": 0.40}),
         FakeResponse(payload={"cash": 100.0, "shares": 0.0, "belief": 0.80, "rho": 1.0}),
     ]
@@ -63,13 +73,16 @@ def test_run_cycle_submits_trade_when_edge_is_large():
     assert outcome == "traded"
     assert submitted["agent_id"] == 7
     assert submitted["quantity"] > 0.0
+    assert agent._shares_by_market[1] >= 0.0
 
 
 def test_run_cycle_skips_when_edge_is_below_threshold():
     agent = AutonomousAgent(
         agent_id=2,
-        market_id="m1",
         api_base_url="http://127.0.0.1:8000/api",
+        belief=0.52,
+        rho=1.0,
+        cash=100.0,
         personality={
             "edge_threshold": 0.03,
             "participation_rate": 1.0,
@@ -79,6 +92,7 @@ def test_run_cycle_skips_when_edge_is_below_threshold():
     )
 
     responses = [
+        FakeResponse(payload={"markets": [{"id": 1, "price": 0.50}]}),
         FakeResponse(payload={"price": 0.50}),
         FakeResponse(payload={"cash": 100.0, "shares": 0.0, "belief": 0.52, "rho": 1.0}),
     ]
@@ -96,8 +110,10 @@ def test_run_cycle_skips_when_edge_is_below_threshold():
 def test_run_cycle_skips_when_participation_check_fails():
     agent = AutonomousAgent(
         agent_id=3,
-        market_id="m1",
         api_base_url="http://127.0.0.1:8000/api",
+        belief=0.80,
+        rho=1.0,
+        cash=100.0,
         personality={
             "edge_threshold": 0.01,
             "participation_rate": 0.20,
@@ -107,6 +123,7 @@ def test_run_cycle_skips_when_participation_check_fails():
     )
 
     responses = [
+        FakeResponse(payload={"markets": [{"id": 1, "price": 0.40}]}),
         FakeResponse(payload={"price": 0.40}),
         FakeResponse(payload={"cash": 100.0, "shares": 0.0, "belief": 0.80, "rho": 1.0}),
     ]
@@ -121,11 +138,62 @@ def test_run_cycle_skips_when_participation_check_fails():
     assert post_calls == []
 
 
+def test_run_cycle_uses_constructor_state_before_position_exists():
+    agent = AutonomousAgent(
+        agent_id=5,
+        api_base_url="http://127.0.0.1:8000/api",
+        belief=0.80,
+        rho=1.0,
+        cash=250.0,
+        personality={
+            "edge_threshold": 0.01,
+            "participation_rate": 1.0,
+            "trade_size_noise": 0.0,
+        },
+        rng=FakeRng(uniform_values=[1.0], random_values=[0.0]),
+    )
+
+    get_calls = []
+
+    def fake_get(_url, timeout):
+        get_calls.append(_url)
+        if _url.endswith("/markets"):
+            return FakeResponse(payload={"markets": [{"id": 11, "price": 0.30}]})
+        if _url.endswith("/price"):
+            return FakeResponse(payload={"price": 0.30})
+        return FakeResponse(status_code=404, payload={"detail": "agent has no position"})
+
+    submitted = {}
+
+    def fake_post(_url, json, timeout):
+        submitted.update(json)
+        return FakeResponse(
+            payload={
+                "trade_id": "t-new",
+                "agent_cash_after": 200.0,
+                "agent_shares_after": 50.0,
+            }
+        )
+
+    agent.session.get = fake_get
+    agent.session.post = fake_post
+
+    outcome = agent.run_cycle()
+
+    assert outcome == "traded"
+    assert submitted["quantity"] > 0.0
+    assert agent.cash == 200.0
+    assert agent._shares_by_market[11] == 50.0
+    assert any(url.endswith("/agent/5") for url in get_calls)
+
+
 def test_run_retries_after_409_conflict():
     agent = AutonomousAgent(
         agent_id=9,
-        market_id="m1",
         api_base_url="http://127.0.0.1:8000/api",
+        belief=0.80,
+        rho=1.0,
+        cash=100.0,
         personality={
             "check_interval_mean": 0.0,
             "check_interval_jitter": 0.0,
@@ -147,6 +215,8 @@ def test_run_retries_after_409_conflict():
         return False
 
     def fake_get(_url, timeout):
+        if _url.endswith("/markets"):
+            return FakeResponse(payload={"markets": [{"id": 1, "price": 0.40}]})
         return FakeResponse(
             payload={"price": 0.40}
             if _url.endswith("/price")

@@ -41,7 +41,7 @@ from settlement import compute_settlement  # noqa: E402
 from simulation_engine import SimulationEngine  # noqa: E402
 
 from .llm_comments import generate_comment_text, llm_budget_initial
-from .market_routes import router as market_router
+from .market_routes import get_market_service, router as market_router
 
 # Sparse synthetic chat: each (agent, round) gets a comment only with this probability.
 COMMENT_PROB_PER_AGENT_ROUND = 0.01
@@ -111,6 +111,21 @@ app.add_middleware(
 )
 # Persistent LMSR/CDA market + autonomous agent threads (see ``api/market_routes.py``).
 app.include_router(market_router, prefix="/api")
+
+
+@app.get("/api/markets")
+def list_open_markets(limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    """Top-level market discovery endpoint used by autonomous agents."""
+    try:
+        return _jsonable(
+            get_market_service().list_markets_with_summary(
+                status="open",
+                limit=limit,
+                offset=offset,
+            )
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _belief_spec(body: SimulateRequest) -> BeliefSpec:
