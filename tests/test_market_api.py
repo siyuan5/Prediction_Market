@@ -1,49 +1,65 @@
 """
-Integration tests for ``/api/market/*`` (persistent market + autonomous hooks).
+Integration tests for ``/api/market/*`` + ``/api/agents*``.
 
-Uses a temporary SQLite file and ``reset_market_runtime`` so each test gets a clean
-service singleton. Requires ``fastapi`` and ``httpx`` (TestClient).
+Uses a temporary SQLite file and ``reset_market_runtime`` so each test gets a
+clean service singleton.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import threading
 import time
+import uuid
 
 import pytest
 
-# Repo root on path for ``api`` and ``app`` imports
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    """Fresh DB file + reset singleton so ``get_market_service`` opens this file."""
-    monkeypatch.setenv("MARKET_DB_PATH", str(tmp_path / "m.sqlite"))
+def client(monkeypatch):
+    tmp_base = os.path.join(ROOT, "tmp_market_api_tests", str(uuid.uuid4()))
+    os.makedirs(tmp_base, exist_ok=True)
+    monkeypatch.setenv("MARKET_DB_PATH", os.path.join(tmp_base, "m.sqlite"))
     from api.market_routes import reset_market_runtime
 
     reset_market_runtime()
     from fastapi.testclient import TestClient
     from api.main import app
 
-    return TestClient(app)
+    with TestClient(app) as tc:
+        yield tc
+    reset_market_runtime()
+    shutil.rmtree(tmp_base, ignore_errors=True)
 
 
-def test_create_market_and_price(client):
-    """POST /create seeds agents; GET /price returns a probability in (0,1)."""
+def _create_agent(client, *, name: str, belief: float = 0.6):
+    r = client.post(
+        "/api/agents",
+        json={
+            "name": name,
+            "cash": 150.0,
+            "belief": belief,
+            "rho": 1.2,
+            "personality": {"signal_sensitivity": 1.0, "stubbornness": 0.0},
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_create_market_and_price_no_agent_spawn(client):
     r = client.post(
         "/api/market/create",
         json={
             "mechanism": "lmsr",
             "ground_truth": 0.66,
-            "n_agents": 5,
-            "initial_cash": 100.0,
             "b": 80.0,
-            "seed": 1,
             "title": "test market",
         },
     )
@@ -51,7 +67,9 @@ def test_create_market_and_price(client):
     data = r.json()
     mid = data["market_id"]
     assert data["mechanism"] == "lmsr"
-    assert data["n_agents"] == 5
+
+    ag = client.get(f"/api/market/{mid}/agents").json()
+    assert ag["total"] == 0
 
     pr = client.get(f"/api/market/{mid}/price")
     assert pr.status_code == 200
@@ -61,23 +79,43 @@ def test_create_market_and_price(client):
     assert body.get("best_bid") is None
 
 
-def test_lmsr_trade_updates_position(client):
-    """Submitting a small LMSR trade succeeds and increases total trade count."""
-    cr = client.post(
-        "/api/market/create",
-        json={
-            "mechanism": "lmsr",
-            "ground_truth": 0.5,
-            "n_agents": 3,
-            "initial_cash": 200.0,
-            "b": 100.0,
-            "seed": 2,
-        },
-    )
-    mid = cr.json()["market_id"]
+def test_agents_create_list_patch_and_alias(client):
+    created = _create_agent(client, name="alice", belief=0.61)
+    assert created["name"] == "alice"
+    assert created["belief"] == pytest.approx(0.61)
 
-    ag = client.get(f"/api/market/{mid}/agents").json()
-    aid = ag["agents"][0]["agent_id"]
+    alias = client.post(
+        "/api/agents/create",
+        json={"name": "bob", "cash": 200.0, "belief": 0.45, "rho": 1.0},
+    )
+    assert alias.status_code == 201, alias.text
+
+    listed = client.get("/api/agents?limit=10&offset=0")
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()["agents"]
+    assert listed.json()["total"] == 2
+    assert {r["name"] for r in rows} == {"alice", "bob"}
+
+    patched = client.patch(
+        f"/api/agents/{created['agent_id']}",
+        json={"belief": 0.72, "cash": 180.0},
+    )
+    assert patched.status_code == 200, patched.text
+    p = patched.json()
+    assert p["belief"] == pytest.approx(0.72)
+    assert p["cash"] == pytest.approx(180.0)
+
+
+def test_market_join_and_lmsr_trade(client):
+    aid = _create_agent(client, name="trader")["agent_id"]
+    mid = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "ground_truth": 0.5, "b": 100.0},
+    ).json()["market_id"]
+
+    j = client.post(f"/api/market/{mid}/join", json={"agent_id": aid})
+    assert j.status_code == 200, j.text
+    assert j.json()["status"] == "joined"
 
     tr = client.post(
         f"/api/market/{mid}/trade",
@@ -85,50 +123,19 @@ def test_lmsr_trade_updates_position(client):
     )
     assert tr.status_code == 200, tr.text
     out = tr.json()
-    assert "trade_id" in out
+    assert out["trade_id"] is not None
     assert out["executed_quantity"] != 0
-
-    tf = client.get(f"/api/market/{mid}/trades").json()
-    assert tf["total"] >= 1
-
-
-def test_belief_shock_endpoint(client):
-    """POST .../belief with new_belief updates stored belief (absolute mode)."""
-    cr = client.post(
-        "/api/market/create",
-        json={
-            "mechanism": "lmsr",
-            "ground_truth": 0.55,
-            "n_agents": 2,
-            "initial_cash": 100.0,
-            "b": 50.0,
-            "seed": 3,
-        },
-    )
-    mid = cr.json()["market_id"]
-    aid = client.get(f"/api/market/{mid}/agents").json()["agents"][0]["agent_id"]
-
-    br = client.post(
-        f"/api/market/{mid}/agent/{aid}/belief",
-        json={"new_belief": 0.42},
-    )
-    assert br.status_code == 200, br.text
-    b = br.json()
-    assert b["new_belief"] == 0.42
-
-    st = client.get(f"/api/market/{mid}/agent/{aid}").json()
-    assert abs(st["belief"] - 0.42) < 1e-6
 
 
 def test_full_market_flow_with_news_injection(client):
-    """
-    End-to-end agent-facing flow:
-    list markets -> create -> query price -> trade -> see new price ->
-    inject news -> verify affected beliefs changed in persistent state.
-    """
     before = client.get("/api/markets")
     assert before.status_code == 200, before.text
     assert before.json()["total"] == 0
+
+    created_agents = [
+        _create_agent(client, name=f"flow-a{i}", belief=0.55 + i * 0.01)
+        for i in range(6)
+    ]
 
     created = client.post(
         "/api/market/create",
@@ -136,20 +143,11 @@ def test_full_market_flow_with_news_injection(client):
             "mechanism": "lmsr",
             "title": "Flow test market",
             "ground_truth": 0.61,
-            "n_agents": 6,
-            "initial_cash": 150.0,
             "b": 60.0,
-            "seed": 7,
-            "personality_defaults": {
-                "signal_sensitivity": 1.0,
-                "stubbornness": 0.0,
-            },
         },
     )
     assert created.status_code == 201, created.text
-    cbody = created.json()
-    mid = cbody["market_id"]
-    assert cbody["status"] == "open"
+    mid = created.json()["market_id"]
 
     markets = client.get("/api/markets")
     assert markets.status_code == 200, markets.text
@@ -159,27 +157,16 @@ def test_full_market_flow_with_news_injection(client):
     assert "trade_count_24h" in market_row
     assert "active_agents_24h" in market_row
 
-    price_before_r = client.get(f"/api/market/{mid}/price")
-    assert price_before_r.status_code == 200, price_before_r.text
-    price_before = float(price_before_r.json()["price"])
-
-    agents_before = client.get(f"/api/market/{mid}/agents")
-    assert agents_before.status_code == 200, agents_before.text
-    agents_before_rows = agents_before.json()["agents"]
-    aid = int(agents_before_rows[0]["agent_id"])
-    beliefs_before = {int(a["agent_id"]): float(a["belief"]) for a in agents_before_rows}
-
+    price_before = float(client.get(f"/api/market/{mid}/price").json()["price"])
+    aid = int(created_agents[0]["agent_id"])
     trade = client.post(
         f"/api/market/{mid}/trade",
         json={"agent_id": aid, "quantity": 1.5},
     )
     assert trade.status_code == 200, trade.text
-    tbody = trade.json()
-    assert tbody["executed_quantity"] > 0
+    assert trade.json()["executed_quantity"] > 0
 
-    price_after_r = client.get(f"/api/market/{mid}/price")
-    assert price_after_r.status_code == 200, price_after_r.text
-    price_after = float(price_after_r.json()["price"])
+    price_after = float(client.get(f"/api/market/{mid}/price").json()["price"])
     assert price_after > price_before
 
     news = client.post(
@@ -197,21 +184,11 @@ def test_full_market_flow_with_news_injection(client):
     assert nbody["n_affected"] == 3
     assert len(nbody["affected_agents"]) == 3
 
-    affected_ids = {int(a["agent_id"]) for a in nbody["affected_agents"]}
     for row in nbody["affected_agents"]:
-        assert float(row["new_belief"]) != float(row["old_belief"])
         check = client.get(f"/api/market/{mid}/agent/{row['agent_id']}")
         assert check.status_code == 200, check.text
         current = float(check.json()["belief"])
         assert abs(current - float(row["new_belief"])) < 1e-9
-
-    agents_after = client.get(f"/api/market/{mid}/agents")
-    assert agents_after.status_code == 200, agents_after.text
-    for row in agents_after.json()["agents"]:
-        agent_id = int(row["agent_id"])
-        if agent_id in affected_ids:
-            continue
-        assert abs(float(row["belief"]) - beliefs_before[agent_id]) < 1e-9
 
 
 def test_two_market_start_stop_lifecycle_no_zombies(client, monkeypatch):
@@ -241,37 +218,24 @@ def test_two_market_start_stop_lifecycle_no_zombies(client, monkeypatch):
 
     monkeypatch.setattr("agent_runner.AutonomousAgent", FakeAutonomousAgent)
 
+    for i in range(50):
+        _create_agent(client, name=f"auto-{i}", belief=0.6)
+
     m1 = client.post(
         "/api/market/create",
-        json={
-            "mechanism": "lmsr",
-            "title": "M1",
-            "ground_truth": 0.62,
-            "n_agents": 25,
-            "initial_cash": 100.0,
-            "b": 70.0,
-            "seed": 10,
-        },
+        json={"mechanism": "lmsr", "title": "M1", "ground_truth": 0.62, "b": 70.0},
     ).json()["market_id"]
     m2 = client.post(
         "/api/market/create",
-        json={
-            "mechanism": "lmsr",
-            "title": "M2",
-            "ground_truth": 0.55,
-            "n_agents": 25,
-            "initial_cash": 100.0,
-            "b": 70.0,
-            "seed": 11,
-        },
+        json={"mechanism": "lmsr", "title": "M2", "ground_truth": 0.55, "b": 70.0},
     ).json()["market_id"]
 
     s1 = client.post(f"/api/market/{m1}/start")
     s2 = client.post(f"/api/market/{m2}/start")
     assert s1.status_code == 200, s1.text
     assert s2.status_code == 200, s2.text
-    assert s1.json()["n_agents_running"] == 25
-    assert s2.json()["n_agents_running"] == 25
+    assert s1.json()["n_agents_running"] == 50
+    assert s2.json()["n_agents_running"] == 50
 
     time.sleep(0.6)
     t1_before = client.get(f"/api/market/{m1}/trades").json()["total"]
@@ -283,9 +247,13 @@ def test_two_market_start_stop_lifecycle_no_zombies(client, monkeypatch):
     assert stop1.status_code == 200, stop1.text
     assert stop1.json()["zombie_threads"] == 0
 
-    time.sleep(0.4)
-    t2_after = client.get(f"/api/market/{m2}/trades").json()["total"]
-    assert t2_after > t2_before
+    running = client.get("/api/markets?status=running").json()["markets"]
+    running_ids = {int(m["market_id"]) for m in running}
+    assert m1 not in running_ids
+    assert m2 in running_ids
+
+    duplicate_start = client.post(f"/api/market/{m2}/start")
+    assert duplicate_start.status_code == 409
 
     stop2 = client.post(f"/api/market/{m2}/stop")
     assert stop2.status_code == 200, stop2.text

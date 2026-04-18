@@ -51,28 +51,32 @@ def svc():
     shutil.rmtree(base, ignore_errors=True)
 
 
-def _seed_market(svc: MarketService, slug: str, n_agents: int):
+def _seed_market(svc: MarketService, slug: str):
     mkt = svc.create_market(slug=slug, title=slug, mechanism="lmsr", b=100.0)
     svc.set_market_status(mkt["id"], "open")
+    return int(mkt["id"])
+
+
+def _seed_agents(svc: MarketService, slug: str, n_agents: int):
     agent_ids = []
     for i in range(n_agents):
         a = svc.create_agent(
             name=f"{slug}-a{i}",
             cash=500.0,
-            market_id=mkt["id"],
             belief=0.6,
             rho=1.0,
             personality="{}",
         )
         agent_ids.append(int(a["id"]))
-    return int(mkt["id"]), agent_ids
+    return agent_ids
 
 
 def test_start_stop_two_markets_no_zombie_threads(svc: MarketService):
     FakeAutonomousAgent.created_by_agent.clear()
     FakeAutonomousAgent.crash_once_agents.clear()
-    m1, _ = _seed_market(svc, "m1", 10)
-    m2, _ = _seed_market(svc, "m2", 10)
+    _seed_agents(svc, "base", 10)
+    m1 = _seed_market(svc, "m1")
+    m2 = _seed_market(svc, "m2")
     runner = AgentRunner(
         api_base_url="http://127.0.0.1:8000/api",
         market_service=svc,
@@ -112,7 +116,8 @@ def test_start_stop_two_markets_no_zombie_threads(svc: MarketService):
 
 def test_restarts_dead_agent_thread(svc: MarketService):
     FakeAutonomousAgent.created_by_agent.clear()
-    m1, agent_ids = _seed_market(svc, "crash", 1)
+    agent_ids = _seed_agents(svc, "crash", 1)
+    m1 = _seed_market(svc, "crash-mkt")
     crashing_agent_id = agent_ids[0]
     FakeAutonomousAgent.crash_once_agents = {crashing_agent_id}
 

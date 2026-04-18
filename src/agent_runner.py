@@ -82,7 +82,7 @@ class AgentRunner:
 
         self._market_service.get_market(market_id)
         self._market_service.set_market_status(market_id, "running")
-        rows = self._market_service.list_agents_for_market(market_id)
+        rows = self._market_service.list_agents(limit=1_000_000, offset=0)["agents"]
 
         with self._lock:
             self._ensure_monitor_locked()
@@ -191,6 +191,30 @@ class AgentRunner:
         self.stop_all()
         self._request_monitor_shutdown()
 
+    def register_or_update_agent(self, agent: Dict[str, Any]) -> None:
+        """
+        Register agent metadata and attach thread to all running markets.
+
+        Called by API agent create/update endpoints so autonomous execution stays
+        global and independent from per-market joins.
+        """
+        seed = self._seed_from_row(agent)
+        aid = seed.agent_id
+        with self._lock:
+            self._agent_seeds[aid] = seed
+            running_markets = set(self._market_agents.keys())
+            if not running_markets:
+                return
+            self._ensure_monitor_locked()
+            state = self._agent_states.get(aid)
+            if state is None:
+                self._start_agent_locked(seed, running_markets)
+            else:
+                state.markets.update(running_markets)
+                state.stop_requested = False
+            for mid in running_markets:
+                self._market_agents[mid].add(aid)
+
     def _seed_from_row(self, row: Dict[str, Any]) -> _AgentSeed:
         raw_personality = row.get("personality")
         personality: Optional[Dict[str, Any]] = None
@@ -204,7 +228,7 @@ class AgentRunner:
             except json.JSONDecodeError:
                 personality = None
         return _AgentSeed(
-            agent_id=int(row["agent_id"]),
+            agent_id=int(row.get("agent_id", row.get("id"))),
             belief=float(row.get("belief") or 0.5),
             rho=float(row.get("rho") or 1.0),
             cash=float(row.get("cash") or 0.0),
@@ -342,4 +366,3 @@ class AgentRunner:
                 self._agent_states.pop(aid, None)
                 self._agent_seeds.pop(aid, None)
         return zombies
-

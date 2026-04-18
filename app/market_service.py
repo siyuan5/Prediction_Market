@@ -160,6 +160,14 @@ class MarketService:
             agent["yes_shares"] = pos["yes_shares"]
         return agent
 
+    def list_agents(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        return self._get_store().list_agents(limit=limit, offset=offset)
+
     def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
         return self._get_store().get_position(agent_id, market_id)
 
@@ -242,6 +250,26 @@ class MarketService:
         with self._begin_immediate():
             return self._get_store().update_agent_portfolio(
                 market_id, agent_id, cash_delta, shares_delta,
+            )
+
+    def update_agent(
+        self,
+        agent_id: int,
+        *,
+        name: Optional[str] = None,
+        cash: Optional[float] = None,
+        belief: Optional[float] = None,
+        rho: Optional[float] = None,
+        personality: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._begin_immediate():
+            return self._get_store().update_agent(
+                agent_id,
+                name=name,
+                cash=cash,
+                belief=belief,
+                rho=rho,
+                personality=personality,
             )
 
     def ensure_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:

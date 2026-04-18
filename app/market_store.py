@@ -389,6 +389,70 @@ class MarketStore:
             raise ValueError(f"Agent {agent_id} not found")
         return self._agent_row_to_dict(row)
 
+    def list_agents(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        total_row = self.conn.execute("SELECT COUNT(*) AS c FROM agents").fetchone()
+        total = int(total_row["c"] if total_row is not None else 0)
+        rows = self.conn.execute(
+            "SELECT * FROM agents ORDER BY id LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        return {
+            "agents": [self._agent_row_to_dict(r) for r in rows],
+            "total": total,
+        }
+
+    def update_agent(
+        self,
+        agent_id: int,
+        *,
+        name: Optional[str] = None,
+        cash: Optional[float] = None,
+        belief: Optional[float] = None,
+        rho: Optional[float] = None,
+        personality: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        updates: List[str] = []
+        params: List[Any] = []
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if cash is not None:
+            updates.append("cash = ?")
+            params.append(cash)
+        if belief is not None:
+            updates.append("belief = ?")
+            params.append(belief)
+        if rho is not None:
+            updates.append("rho = ?")
+            params.append(rho)
+        if personality is not None:
+            updates.append("personality = ?")
+            params.append(personality)
+        if not updates:
+            return self.get_agent(agent_id)
+        with self._transaction():
+            exists = self.conn.execute(
+                "SELECT id FROM agents WHERE id = ?",
+                (agent_id,),
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"Agent {agent_id} not found")
+            params.append(agent_id)
+            self.conn.execute(
+                f"UPDATE agents SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+        return self.get_agent(agent_id)
+
     def set_agent_belief(self, agent_id: int, new_belief: float) -> float:
         """Update global agent belief and return the previous value."""
         with self._transaction():

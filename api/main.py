@@ -41,7 +41,11 @@ from settlement import compute_settlement  # noqa: E402
 from simulation_engine import SimulationEngine  # noqa: E402
 
 from .llm_comments import generate_comment_text, llm_budget_initial
-from .market_routes import get_market_service, router as market_router
+from .market_routes import (
+    agents_router,
+    get_market_service,
+    router as market_router,
+)
 
 # Sparse synthetic chat: each (agent, round) gets a comment only with this probability.
 COMMENT_PROB_PER_AGENT_ROUND = 0.01
@@ -111,6 +115,7 @@ app.add_middleware(
 )
 # Persistent LMSR/CDA market + autonomous agent threads (see ``api/market_routes.py``).
 app.include_router(market_router, prefix="/api")
+app.include_router(agents_router, prefix="/api")
 
 
 @app.get("/api/markets")

@@ -2,7 +2,8 @@
  * Live “autonomous market” UI: SQLite-backed LMSR market exposed at ``/api/market/*``.
  *
  * Flow:
- *   1. **Create market** — seeds many agents with random beliefs (POST /api/market/create).
+ *   1. **Create agents + market** — create global agents (POST /api/agents/create),
+ *      then create a market (POST /api/market/create).
  *   2. **Start** — server spawns autonomous trader threads that poll and trade (POST .../start).
  *   3. **Polling** — this component repeatedly fetches price and new trades (GET .../price, .../trades).
  *   4. **Belief shock** — optional POST to nudge one agent’s belief mid-run (belief shock experiment).
@@ -34,7 +35,6 @@ type TradeRow = {
 type CreateResponse = {
   market_id: number;
   mechanism: string;
-  n_agents: number;
   initial_price: number;
   ground_truth: number;
 };
@@ -121,18 +121,40 @@ export function AutonomousMarketPanel() {
     setCreateInfo(null);
     setPrice(null);
     try {
+      const runTag = Date.now();
+      for (let i = 0; i < nAgents; i += 1) {
+        const beliefNoise = (Math.random() - 0.5) * 0.2;
+        const belief = Math.min(0.99, Math.max(0.01, groundTruth + beliefNoise));
+        const agentRes = await fetch("/api/agents/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: `ui-auto-${runTag}-${i}`,
+            cash: 100.0,
+            belief,
+            rho: 1.0,
+            personality: {
+              check_interval_mean: 2.0,
+              check_interval_jitter: 1.0,
+              edge_threshold: 0.03,
+              participation_rate: 0.8,
+              trade_size_noise: 0.2,
+              signal_sensitivity: 0.5,
+              stubbornness: 0.3,
+            },
+          }),
+        });
+        if (!agentRes.ok) throw new Error(await agentRes.text());
+      }
+
       const res = await fetch("/api/market/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mechanism: "lmsr",
           ground_truth: groundTruth,
-          n_agents: nAgents,
-          initial_cash: 100.0,
           b,
-          seed,
           title,
-          belief_spec: { mode: "gaussian", sigma: 0.1 },
         }),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -280,7 +302,7 @@ export function AutonomousMarketPanel() {
       {createInfo ? (
         <div className="autonomous-status">
           <p>
-            Market <code>#{createInfo.market_id}</code> · {createInfo.n_agents} agents · P* ={" "}
+            Market <code>#{createInfo.market_id}</code> · {nAgents} agents · P* ={" "}
             {createInfo.ground_truth.toFixed(2)} · initial price {createInfo.initial_price.toFixed(4)}
           </p>
           {price ? (

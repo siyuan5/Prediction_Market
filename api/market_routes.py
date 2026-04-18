@@ -31,13 +31,13 @@ for _p in (_ROOT / "app", _ROOT / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from belief_init import BeliefSpec, sample_beliefs  # noqa: E402
 from agent_runner import AgentRunner  # noqa: E402
 from market_service import MarketService  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/market", tags=["market"])
+agents_router = APIRouter(tags=["agents"])
 _DEFAULT_SIGNAL_SENSITIVITY = 0.50
 _DEFAULT_STUBBURNNESS = 0.30
 
@@ -91,27 +91,48 @@ def get_agent_runner() -> AgentRunner:
 # --- Pydantic request bodies (match FINAL_PHASE_TASKS contracts) ---
 
 
-class RhoDistribution(BaseModel):
-    min: float = Field(0.5, ge=0.01, le=10.0)
-    max: float = Field(2.0, ge=0.01, le=10.0)
-
-
-class BeliefSpecPayload(BaseModel):
-    mode: str = "gaussian"
-    sigma: float = Field(0.10, ge=0.0, le=0.5)
-
-
 class MarketCreateRequest(BaseModel):
     mechanism: str = "lmsr"
     ground_truth: float = Field(0.70, ge=0.01, le=0.99)
-    n_agents: int = Field(50, ge=2, le=500)
-    initial_cash: float = Field(100.0, gt=0)
     b: float = Field(100.0, gt=0)
-    belief_spec: BeliefSpecPayload = Field(default_factory=BeliefSpecPayload)
-    rho_distribution: RhoDistribution = Field(default_factory=RhoDistribution)
-    personality_defaults: Optional[Dict[str, float]] = None
-    seed: int = 42
     title: str = "Autonomous market"
+    description: str = ""
+    tick_size: float = 0.0001
+    min_price: float = 0.001
+    max_price: float = 0.999
+    initial_price: float = 0.5
+
+
+class AgentCreateRequest(BaseModel):
+    name: str
+    cash: float = Field(100.0, gt=0)
+    belief: Optional[float] = Field(default=None, ge=0.01, le=0.99)
+    rho: Optional[float] = Field(default=None, ge=0.01, le=10.0)
+    personality: Optional[Dict[str, Any]] = None
+
+
+class AgentPatchRequest(BaseModel):
+    name: Optional[str] = None
+    cash: Optional[float] = Field(default=None, gt=0)
+    belief: Optional[float] = Field(default=None, ge=0.01, le=0.99)
+    rho: Optional[float] = Field(default=None, ge=0.01, le=10.0)
+    personality: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def at_least_one(self) -> "AgentPatchRequest":
+        if (
+            self.name is None
+            and self.cash is None
+            and self.belief is None
+            and self.rho is None
+            and self.personality is None
+        ):
+            raise ValueError("Provide at least one field to update")
+        return self
+
+
+class MarketJoinRequest(BaseModel):
+    agent_id: int
 
 
 class LmsrTradeRequest(BaseModel):
@@ -187,31 +208,89 @@ def _signal_profile(personality: Dict[str, Any]) -> Tuple[float, float]:
     return float(np.clip(sensitivity, 0.0, 1.0)), float(np.clip(stubbornness, 0.0, 1.0))
 
 
+def _agent_response_row(agent: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "agent_id": int(agent["id"]),
+        "name": str(agent["name"]),
+        "cash": float(agent["cash"]),
+        "belief": float(agent["belief"]) if agent.get("belief") is not None else None,
+        "rho": float(agent["rho"]) if agent.get("rho") is not None else None,
+        "personality": _parse_personality(agent.get("personality")),
+        "created_at": agent.get("created_at"),
+    }
+
+
 # --- Routes ---
+
+
+@agents_router.post("/agents", status_code=201)
+def create_agent(body: AgentCreateRequest) -> Dict[str, Any]:
+    svc = get_market_service()
+    personality_json = json.dumps(body.personality) if body.personality is not None else None
+    try:
+        agent = svc.create_agent(
+            body.name,
+            body.cash,
+            belief=body.belief,
+            rho=body.rho,
+            personality=personality_json,
+        )
+    except ValueError as e:
+        _http_from_value(e)
+    get_agent_runner().register_or_update_agent(agent)
+    return _agent_response_row(agent)
+
+
+@agents_router.post("/agents/create", status_code=201)
+def create_agent_alias(body: AgentCreateRequest) -> Dict[str, Any]:
+    """Backward-compatible alias for clients using /agents/create."""
+    return create_agent(body)
+
+
+@agents_router.get("/agents")
+def list_global_agents(
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> Dict[str, Any]:
+    svc = get_market_service()
+    data = svc.list_agents(limit=limit, offset=offset)
+    return {
+        "agents": [_agent_response_row(a) for a in data["agents"]],
+        "total": int(data["total"]),
+    }
+
+
+@agents_router.patch("/agents/{agent_id}")
+def patch_agent(agent_id: int, body: AgentPatchRequest) -> Dict[str, Any]:
+    svc = get_market_service()
+    personality_json = json.dumps(body.personality) if body.personality is not None else None
+    try:
+        updated = svc.update_agent(
+            agent_id,
+            name=body.name,
+            cash=body.cash,
+            belief=body.belief,
+            rho=body.rho,
+            personality=personality_json,
+        )
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    get_agent_runner().register_or_update_agent(updated)
+    return _agent_response_row(updated)
 
 
 @router.post("/create", status_code=201)
 def create_market(body: MarketCreateRequest) -> Dict[str, Any]:
     """
-    Create one market, ``n_agents`` agents with sampled beliefs and rhos, then
-    set status to **open** so manual or autonomous trades are allowed.
+    Create one market only (no agent creation) and set status to **open**.
+
+    Agents are managed independently through `/api/agents*` endpoints.
     """
     if body.mechanism not in ("lmsr", "cda"):
         raise HTTPException(status_code=400, detail="mechanism must be 'lmsr' or 'cda'")
-    if body.rho_distribution.min > body.rho_distribution.max:
-        raise HTTPException(status_code=400, detail="rho_distribution.min must be <= max")
 
     svc = get_market_service()
-    rng = np.random.default_rng(body.seed)
     slug = f"m-{uuid.uuid4().hex[:12]}"
-    spec = BeliefSpec(
-        mode=body.belief_spec.mode,
-        sigma=body.belief_spec.sigma,
-    )
-    beliefs = sample_beliefs(
-        body.ground_truth, body.n_agents, spec, rng,
-    )
-    pers_json = json.dumps(body.personality_defaults or {})
 
     mkt = svc.create_market(
         slug,
@@ -219,27 +298,20 @@ def create_market(body: MarketCreateRequest) -> Dict[str, Any]:
         mechanism=body.mechanism,
         b=body.b,
         ground_truth=body.ground_truth,
+        description=body.description,
+        tick_size=body.tick_size,
+        min_price=body.min_price,
+        max_price=body.max_price,
+        initial_price=body.initial_price,
     )
     mid = int(mkt["id"])
-    _market_initial_cash[mid] = float(body.initial_cash)
-
-    for i in range(body.n_agents):
-        rho = float(rng.uniform(body.rho_distribution.min, body.rho_distribution.max))
-        svc.create_agent(
-            f"auto-{mid}-{i}",
-            body.initial_cash,
-            market_id=mid,
-            belief=float(beliefs[i]),
-            rho=rho,
-            personality=pers_json,
-        )
+    _market_initial_cash[mid] = 100.0
 
     svc.set_market_status(mid, "open")
     price0 = svc.get_price(mid)
     return {
         "market_id": mid,
         "mechanism": body.mechanism,
-        "n_agents": body.n_agents,
         "initial_price": price0,
         "ground_truth": body.ground_truth,
         "status": "open",
@@ -403,10 +475,12 @@ def post_agent_belief(
         svc.get_market(market_id)
     except ValueError as e:
         _http_from_value(e, not_found=True)
+    try:
+        svc.get_agent(agent_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
     pos = svc.get_position(agent_id, market_id)
-    if pos.get("belief") is None:
-        raise HTTPException(status_code=404, detail="agent has no position in this market")
-    old = float(pos["belief"])
+    old = float(pos["belief"]) if pos.get("belief") is not None else 0.5
     if body.new_belief is not None:
         new_b = float(np.clip(float(body.new_belief), 0.01, 0.99))
     else:
@@ -424,8 +498,30 @@ def post_agent_belief(
     }
 
 
+@router.post("/{market_id}/join")
+def join_market(market_id: int, body: MarketJoinRequest) -> Dict[str, Any]:
+    """
+    Explicitly ensure a position row for an agent in a market.
+
+    This is optional; trading already lazy-creates positions.
+    """
+    svc = get_market_service()
+    try:
+        svc.get_market(market_id)
+        svc.get_agent(body.agent_id)
+        pos = svc.ensure_position(body.agent_id, market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    return {
+        "status": "joined",
+        "market_id": market_id,
+        "agent_id": body.agent_id,
+        "shares": float(pos.get("yes_shares") or 0.0),
+    }
+
+
 @router.get("/{market_id}/agents")
-def list_agents(
+def list_market_agents(
     market_id: int,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -435,13 +531,14 @@ def list_agents(
         svc.get_market(market_id)
     except ValueError as e:
         _http_from_value(e, not_found=True)
-    rows = svc.list_agents_for_market(market_id)
+    rows = svc.list_agents(limit=1_000_000, offset=0)["agents"]
     price = svc.get_price(market_id)
     ic = _market_initial_cash.get(market_id, 100.0)
     out: List[Dict[str, Any]] = []
     for r in rows[offset : offset + limit]:
-        aid = int(r["agent_id"])
-        sh = float(r["yes_shares"] or 0)
+        aid = int(r["id"])
+        pos = svc.get_position(aid, market_id)
+        sh = float(pos.get("yes_shares") or 0)
         cash = float(r["cash"])
         bel = float(r["belief"]) if r.get("belief") is not None else 0.5
         rho = float(r["rho"]) if r.get("rho") is not None else 1.0
@@ -504,8 +601,8 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
     except ValueError as e:
         _http_from_value(e, not_found=True)
 
-    rows = svc.list_agents_for_market(market_id)
-    by_id = {int(r["agent_id"]): r for r in rows}
+    rows = svc.list_agents(limit=1_000_000, offset=0)["agents"]
+    by_id = {int(r["id"]): r for r in rows}
 
     selected: List[Dict[str, Any]] = []
     if body.agent_ids is not None:
@@ -529,7 +626,7 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
     else:
         scored: List[Tuple[float, int, Dict[str, Any]]] = []
         for row in rows:
-            aid = int(row["agent_id"])
+            aid = int(row["id"])
             personality = _parse_personality(row.get("personality"))
             sensitivity, stubbornness = _signal_profile(personality)
             if sensitivity + 1e-12 < body.min_signal_sensitivity:
@@ -546,7 +643,7 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
 
     changed: List[Dict[str, Any]] = []
     for row in selected:
-        aid = int(row["agent_id"])
+        aid = int(row["id"])
         old_belief = float(row["belief"]) if row.get("belief") is not None else 0.5
         personality = _parse_personality(row.get("personality"))
         sensitivity, stubbornness = _signal_profile(personality)
