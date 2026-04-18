@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import sys
-import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,34 +32,32 @@ for _p in (_ROOT / "app", _ROOT / "src"):
         sys.path.insert(0, str(_p))
 
 from belief_init import BeliefSpec, sample_beliefs  # noqa: E402
+from agent_runner import AgentRunner  # noqa: E402
 from market_service import MarketService  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/market", tags=["market"])
+_DEFAULT_SIGNAL_SENSITIVITY = 0.50
+_DEFAULT_STUBBURNNESS = 0.30
 
 # --- Singleton service (reset in tests via ``reset_market_runtime``) ---
 _market_service: Optional[MarketService] = None
+_agent_runner: Optional[AgentRunner] = None
 # market_id -> metadata from create()
 _market_initial_cash: Dict[int, float] = {}
-# market_id -> list of (thread, AutonomousAgent) for stop()
-_autonomous_runners: Dict[int, List[Tuple[threading.Thread, Any]]] = {}
-_runners_lock = threading.Lock()
 
 
 def reset_market_runtime() -> None:
     """Clear singleton and runners (used by tests only)."""
-    global _market_service
-    _market_service = None
+    global _market_service, _agent_runner
+    if _agent_runner is not None:
+        _agent_runner.shutdown()
+        _agent_runner = None
+    if _market_service is not None:
+        _market_service.close()
+        _market_service = None
     _market_initial_cash.clear()
-    with _runners_lock:
-        for mid, pairs in list(_autonomous_runners.items()):
-            for _th, ag in pairs:
-                try:
-                    ag.stop()
-                except Exception:
-                    pass
-        _autonomous_runners.clear()
 
 
 def _db_path() -> str:
@@ -79,6 +76,16 @@ def get_market_service() -> MarketService:
 
 def _autonomous_api_base() -> str:
     return os.environ.get("AUTONOMOUS_API_BASE", "http://127.0.0.1:8000/api").rstrip("/")
+
+
+def get_agent_runner() -> AgentRunner:
+    global _agent_runner
+    if _agent_runner is None:
+        _agent_runner = AgentRunner(
+            api_base_url=_autonomous_api_base(),
+            market_service=get_market_service(),
+        )
+    return _agent_runner
 
 
 # --- Pydantic request bodies (match FINAL_PHASE_TASKS contracts) ---
@@ -133,6 +140,23 @@ class BeliefUpdateRequest(BaseModel):
         return self
 
 
+class NewsEventRequest(BaseModel):
+    headline: str = "Breaking news"
+    new_belief: Optional[float] = None
+    delta: Optional[float] = None
+    affected_fraction: float = Field(0.5, ge=0.0, le=1.0)
+    min_signal_sensitivity: float = Field(0.5, ge=0.0, le=1.0)
+    agent_ids: Optional[List[int]] = None
+
+    @model_validator(mode="after")
+    def one_of(self) -> "NewsEventRequest":
+        if (self.new_belief is None) == (self.delta is None):
+            raise ValueError("Provide exactly one of new_belief or delta")
+        if self.new_belief is not None and not (0.01 <= float(self.new_belief) <= 0.99):
+            raise ValueError("new_belief must be in [0.01, 0.99]")
+        return self
+
+
 def _http_from_value(err: ValueError, *, not_found: bool = False) -> None:
     msg = str(err)
     low = msg.lower()
@@ -143,6 +167,24 @@ def _http_from_value(err: ValueError, *, not_found: bool = False) -> None:
     if "status" in low and "trade" in low:
         raise HTTPException(status_code=409, detail=msg)
     raise HTTPException(status_code=400, detail=msg)
+
+
+def _parse_personality(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _signal_profile(personality: Dict[str, Any]) -> Tuple[float, float]:
+    sensitivity = float(personality.get("signal_sensitivity", _DEFAULT_SIGNAL_SENSITIVITY))
+    stubbornness = float(personality.get("stubbornness", _DEFAULT_STUBBURNNESS))
+    return float(np.clip(sensitivity, 0.0, 1.0)), float(np.clip(stubbornness, 0.0, 1.0))
 
 
 # --- Routes ---
@@ -200,6 +242,7 @@ def create_market(body: MarketCreateRequest) -> Dict[str, Any]:
         "n_agents": body.n_agents,
         "initial_price": price0,
         "ground_truth": body.ground_truth,
+        "status": "open",
     }
 
 
@@ -338,12 +381,7 @@ def get_one_agent(market_id: int, agent_id: int) -> Dict[str, Any]:
     shares = float(pos.get("yes_shares") or 0.0)
     pnl = float(ag["cash"]) + shares * float(price) - ic
     pers = pos.get("personality")
-    parsed: Any = pers
-    if isinstance(pers, str) and pers.strip().startswith("{"):
-        try:
-            parsed = json.loads(pers)
-        except json.JSONDecodeError:
-            pass
+    parsed: Any = _parse_personality(pers) if pers is not None else pers
     return {
         "agent_id": agent_id,
         "cash": float(ag["cash"]),
@@ -407,6 +445,7 @@ def list_agents(
         cash = float(r["cash"])
         bel = float(r["belief"]) if r.get("belief") is not None else 0.5
         rho = float(r["rho"]) if r.get("rho") is not None else 1.0
+        pers = _parse_personality(r.get("personality"))
         out.append(
             {
                 "agent_id": aid,
@@ -415,6 +454,7 @@ def list_agents(
                 "belief": bel,
                 "rho": rho,
                 "pnl": cash + sh * float(price) - ic,
+                "personality": pers,
             }
         )
     return {"agents": out, "total": len(rows)}
@@ -449,86 +489,151 @@ def list_trades(
     return {"trades": trades_out, "total": total}
 
 
-def _run_autonomous_loop(agent: Any) -> None:
-    """Thread target: run until ``agent.stop()``."""
-    try:
-        agent.run()
-    except Exception:
-        logger.exception("Autonomous agent thread crashed")
+@router.post("/{market_id}/news")
+def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
+    """
+    Apply a persistent belief shock to a subset of agents in this market.
 
-
-@router.post("/{market_id}/start")
-def start_autonomous(market_id: int) -> Dict[str, Any]:
-    """Spawn one polling thread per agent in this market (LMSR-oriented)."""
-    from autonomous_agent import AutonomousAgent  # noqa: WPS433 — lazy import
-
-    svc = get_market_service()
-    try:
-        m = svc.get_market(market_id)
-    except ValueError as e:
-        _http_from_value(e, not_found=True)
-
-    with _runners_lock:
-        if market_id in _autonomous_runners and _autonomous_runners[market_id]:
-            raise HTTPException(status_code=409, detail="autonomous runners already active")
-
-    try:
-        svc.set_market_status(market_id, "running")
-    except ValueError as e:
-        _http_from_value(e)
-
-    rows = svc.list_agents_for_market(market_id)
-    base = _autonomous_api_base()
-    threads: List[Tuple[threading.Thread, Any]] = []
-    for r in rows:
-        aid = int(r["agent_id"])
-        pers = r.get("personality")
-        pmap: Optional[Dict[str, Any]] = None
-        if isinstance(pers, str) and pers.strip():
-            try:
-                pmap = json.loads(pers)
-            except json.JSONDecodeError:
-                pmap = None
-        ag = AutonomousAgent(
-            agent_id=aid,
-            api_base_url=base,
-            personality=pmap,
-            belief=float(r.get("belief") or 0.5),
-            rho=float(r.get("rho") or 1.0),
-            cash=float(r.get("cash") or 0.0),
-        )
-        th = threading.Thread(target=_run_autonomous_loop, args=(ag,), daemon=True)
-        th.start()
-        threads.append((th, ag))
-
-    with _runners_lock:
-        _autonomous_runners[market_id] = threads
-
-    return {"status": "started", "n_agents_running": len(threads)}
-
-
-@router.post("/{market_id}/stop")
-def stop_autonomous(market_id: int) -> Dict[str, Any]:
-    """Signal all autonomous agents to stop and set market status to **stopped**."""
+    Selection defaults to the most signal-sensitive agents (descending by
+    ``signal_sensitivity * (1 - stubbornness)``) with optional explicit
+    ``agent_ids`` override.
+    """
     svc = get_market_service()
     try:
         svc.get_market(market_id)
     except ValueError as e:
         _http_from_value(e, not_found=True)
 
-    with _runners_lock:
-        pairs = _autonomous_runners.pop(market_id, [])
+    rows = svc.list_agents_for_market(market_id)
+    by_id = {int(r["agent_id"]): r for r in rows}
 
-    for _th, ag in pairs:
+    selected: List[Dict[str, Any]] = []
+    if body.agent_ids is not None:
+        seen: set[int] = set()
+        missing: List[int] = []
+        for aid in body.agent_ids:
+            x = int(aid)
+            if x in seen:
+                continue
+            seen.add(x)
+            row = by_id.get(x)
+            if row is None:
+                missing.append(x)
+            else:
+                selected.append(row)
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"agent ids not found in market {market_id}: {missing}",
+            )
+    else:
+        scored: List[Tuple[float, int, Dict[str, Any]]] = []
+        for row in rows:
+            aid = int(row["agent_id"])
+            personality = _parse_personality(row.get("personality"))
+            sensitivity, stubbornness = _signal_profile(personality)
+            if sensitivity + 1e-12 < body.min_signal_sensitivity:
+                continue
+            score = sensitivity * (1.0 - stubbornness)
+            scored.append((score, aid, row))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        n_pick = int(round(len(scored) * body.affected_fraction))
+        if body.affected_fraction > 0 and n_pick == 0 and scored:
+            n_pick = 1
+        if body.affected_fraction == 0:
+            n_pick = 0
+        selected = [row for _, _, row in scored[:n_pick]]
+
+    changed: List[Dict[str, Any]] = []
+    for row in selected:
+        aid = int(row["agent_id"])
+        old_belief = float(row["belief"]) if row.get("belief") is not None else 0.5
+        personality = _parse_personality(row.get("personality"))
+        sensitivity, stubbornness = _signal_profile(personality)
+        influence = float(np.clip(sensitivity * (1.0 - stubbornness), 0.0, 1.0))
+        target = float(body.new_belief) if body.new_belief is not None else old_belief + float(body.delta)
+        raw_new = old_belief + (target - old_belief) * influence
+        new_belief = float(np.clip(raw_new, 0.01, 0.99))
         try:
-            ag.stop()
-        except Exception:
-            pass
+            svc.set_agent_belief(market_id, aid, new_belief)
+        except ValueError as e:
+            _http_from_value(e, not_found=True)
+        changed.append(
+            {
+                "agent_id": aid,
+                "old_belief": old_belief,
+                "new_belief": new_belief,
+                "signal_sensitivity": sensitivity,
+                "stubbornness": stubbornness,
+                "influence": influence,
+            }
+        )
 
+    if changed:
+        mean_before = float(np.mean([r["old_belief"] for r in changed]))
+        mean_after = float(np.mean([r["new_belief"] for r in changed]))
+    else:
+        mean_before = 0.0
+        mean_after = 0.0
+
+    return {
+        "market_id": market_id,
+        "headline": body.headline,
+        "mode": "absolute" if body.new_belief is not None else "delta",
+        "requested_new_belief": body.new_belief,
+        "requested_delta": body.delta,
+        "affected_fraction": body.affected_fraction,
+        "min_signal_sensitivity": body.min_signal_sensitivity,
+        "n_candidates": len(rows),
+        "n_affected": len(changed),
+        "mean_belief_before": mean_before,
+        "mean_belief_after": mean_after,
+        "affected_agents": changed,
+        "at_timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.post("/{market_id}/start")
+def start_autonomous(market_id: int) -> Dict[str, Any]:
+    """Start autonomous trading lifecycle for one market."""
+    svc = get_market_service()
     try:
-        svc.set_market_status(market_id, "stopped")
-    except ValueError:
-        pass
+        svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+
+    runner = get_agent_runner()
+    if runner.is_running(market_id):
+        raise HTTPException(status_code=409, detail="market already running")
+    try:
+        n_active = runner.start_market(market_id)
+    except ValueError as e:
+        _http_from_value(e)
+
+    return {"status": "started", "n_agents_running": n_active}
+
+
+@router.post("/{market_id}/stop")
+def stop_autonomous(market_id: int) -> Dict[str, Any]:
+    """Stop autonomous lifecycle for one market with thread cleanup."""
+    svc = get_market_service()
+    try:
+        svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+
+    runner = get_agent_runner()
+    if not runner.is_running(market_id):
+        raise HTTPException(status_code=409, detail="market is not running")
+    try:
+        stop_info = runner.stop_market(market_id)
+    except ValueError as e:
+        _http_from_value(e)
 
     n = len(svc.get_trades(market_id=market_id, limit=100_000))
-    return {"status": "stopped", "total_trades": n, "duration_sec": 0.0}
+    return {
+        "status": "stopped",
+        "total_trades": n,
+        "duration_sec": stop_info["duration_sec"],
+        "zombie_threads": stop_info["zombie_threads"],
+    }

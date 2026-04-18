@@ -84,7 +84,7 @@ class AutonomousAgent:
 
     def list_open_markets(self) -> List[Dict[str, Any]]:
         response = self.session.get(
-            self._url("/markets"),
+            self._url("/markets?status=running"),
             timeout=self.timeout,
         )
         if response.status_code >= 400:

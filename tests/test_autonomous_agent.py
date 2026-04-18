@@ -157,7 +157,7 @@ def test_run_cycle_uses_constructor_state_before_position_exists():
 
     def fake_get(_url, timeout):
         get_calls.append(_url)
-        if _url.endswith("/markets"):
+        if "/markets" in _url:
             return FakeResponse(payload={"markets": [{"id": 11, "price": 0.30}]})
         if _url.endswith("/price"):
             return FakeResponse(payload={"price": 0.30})
@@ -215,7 +215,7 @@ def test_run_retries_after_409_conflict():
         return False
 
     def fake_get(_url, timeout):
-        if _url.endswith("/markets"):
+        if "/markets" in _url:
             return FakeResponse(payload={"markets": [{"id": 1, "price": 0.40}]})
         return FakeResponse(
             payload={"price": 0.40}

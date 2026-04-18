@@ -114,16 +114,28 @@ app.include_router(market_router, prefix="/api")
 
 
 @app.get("/api/markets")
-def list_open_markets(limit: int = 100, offset: int = 0) -> Dict[str, Any]:
-    """Top-level market discovery endpoint used by autonomous agents."""
+def list_open_markets(
+    limit: int = 100,
+    offset: int = 0,
+    status: str = "open",
+) -> Dict[str, Any]:
+    """Top-level market discovery endpoint used by autonomous agents and UI."""
     try:
-        return _jsonable(
-            get_market_service().list_markets_with_summary(
-                status="open",
-                limit=limit,
-                offset=offset,
-            )
+        status_filter: Optional[str]
+        status_filter = None if status in ("", "all", "*") else status
+        result = get_market_service().list_markets_with_summary(
+            status=status_filter,
+            limit=limit,
+            offset=offset,
         )
+        markets = []
+        for m in result["markets"]:
+            row = dict(m)
+            row["market_id"] = row["id"]
+            row["trade_count_24h"] = row.get("trade_count", 0)
+            row["active_agents_24h"] = row.get("active_agents", 0)
+            markets.append(row)
+        return _jsonable({"markets": markets, "total": result["total"]})
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
