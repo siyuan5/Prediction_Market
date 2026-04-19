@@ -1,5 +1,11 @@
 """
 Autonomous CRRA trader that polls the market API and submits trades.
+
+Agent beliefs and personalities are initialised at construction time and remain
+independent of any market the agent participates in.  The ``signal_sensitivity``
+and ``stubbornness`` personality fields govern how much external belief updates
+(e.g. from news events that change the global agent belief in the DB) are
+incorporated into the agent's internal belief state each cycle.
 """
 
 from __future__ import annotations
@@ -13,23 +19,19 @@ import requests
 
 try:
     from .crra_math import compute_optimal_trade
+    from .personality import DEFAULT_POPULATION_DIST, Personality, sample_personality
 except ImportError:
     from crra_math import compute_optimal_trade
-
-
-DEFAULT_PERSONALITY: Dict[str, float] = {
-    "check_interval_mean": 2.0,
-    "check_interval_jitter": 1.0,
-    "edge_threshold": 0.03,
-    "participation_rate": 0.80,
-    "trade_size_noise": 0.20,
-    "signal_sensitivity": 0.50,
-    "stubbornness": 0.30,
-}
+    from personality import DEFAULT_POPULATION_DIST, Personality, sample_personality
 
 
 class AutonomousAgent:
-    """Polls the API, computes a CRRA trade, and optionally submits it."""
+    """Polls the API, computes a CRRA trade, and optionally submits it.
+
+    The agent owns its belief state.  Markets never override it; external belief
+    changes (news events, manual updates) are incorporated only through the
+    ``signal_sensitivity`` / ``stubbornness`` personality filter.
+    """
 
     def __init__(
         self,
@@ -56,25 +58,29 @@ class AutonomousAgent:
         self._stop_flag = threading.Event()
         self._shares_by_market: Dict[int, float] = {}
 
-        merged = dict(DEFAULT_PERSONALITY)
-        if personality is not None:
-            if isinstance(personality, Mapping):
-                merged.update(personality)
-            else:
-                merged.update(vars(personality))
-        self.personality = merged
+        # Normalise personality to a Personality dataclass so all 7 fields are
+        # always present and typed — independent of whatever dict the caller passes.
+        if personality is None:
+            self.personality = Personality()
+        elif isinstance(personality, Personality):
+            self.personality = personality
+        elif isinstance(personality, Mapping):
+            self.personality = Personality.from_dict(dict(personality))
+        else:
+            self.personality = Personality.from_dict(vars(personality))
 
     def _url(self, path: str) -> str:
         if not path.startswith("/"):
             path = "/" + path
         return f"{self.api_base_url}{path}"
 
-    def _personality_float(self, key: str) -> float:
-        return float(self.personality.get(key, DEFAULT_PERSONALITY[key]))
+    def _p(self, key: str) -> float:
+        """Return personality field value as float."""
+        return float(getattr(self.personality, key))
 
     def _wait_for_next_cycle(self) -> bool:
-        mean = max(0.0, self._personality_float("check_interval_mean"))
-        jitter = max(0.0, self._personality_float("check_interval_jitter"))
+        mean = max(0.0, self._p("check_interval_mean"))
+        jitter = max(0.0, self._p("check_interval_jitter"))
         sleep_low = max(0.0, mean - jitter)
         sleep_high = max(sleep_low, mean + jitter)
         return self._stop_flag.wait(self.rng.uniform(sleep_low, sleep_high))
@@ -176,19 +182,35 @@ class AutonomousAgent:
 
         price = float(price_snapshot["price"])
         if agent_state is None:
-            belief = self.belief
             cash = self.cash
             shares = float(self._shares_by_market.get(market_id, 0.0))
             rho = self.rho
         else:
-            belief = float(agent_state["belief"])
+            # Market state provides cash, shares, and rho — all market-specific.
+            # Belief is NOT copied directly from the market; instead, we check
+            # whether the global agent belief was externally updated (e.g. by a
+            # news event) and incorporate it through the personality filter so
+            # the agent's beliefs stay agent-owned, not market-owned.
             cash = float(agent_state["cash"])
             shares = float(agent_state["shares"])
             rho = float(agent_state["rho"])
-            self.belief = belief
             self.cash = cash
             self.rho = rho
             self._shares_by_market[market_id] = shares
+
+            global_belief_raw = agent_state.get("belief")
+            if global_belief_raw is not None:
+                global_belief = float(global_belief_raw)
+                if abs(global_belief - self.belief) > 1e-9:
+                    # Apply signal_sensitivity and stubbornness to blend the
+                    # externally-updated global belief into the agent's state.
+                    sensitivity = min(max(self._p("signal_sensitivity"), 0.0), 1.0)
+                    stubbornness = min(max(self._p("stubbornness"), 0.0), 1.0)
+                    influence = sensitivity * (1.0 - stubbornness)
+                    raw = self.belief + influence * (global_belief - self.belief)
+                    self.belief = max(0.01, min(0.99, raw))
+
+        belief = self.belief
 
         x_star = compute_optimal_trade(
             belief=belief,
@@ -198,14 +220,14 @@ class AutonomousAgent:
             rho=rho,
         )
 
-        trade_size_noise = min(max(self._personality_float("trade_size_noise"), 0.0), 1.0)
+        trade_size_noise = min(max(self._p("trade_size_noise"), 0.0), 1.0)
         x_star *= self.rng.uniform(1.0 - trade_size_noise, 1.0 + trade_size_noise)
 
-        edge_threshold = max(0.0, self._personality_float("edge_threshold"))
+        edge_threshold = max(0.0, self._p("edge_threshold"))
         if abs(belief - price) < edge_threshold:
             return "edge_too_small"
 
-        participation_rate = min(max(self._personality_float("participation_rate"), 0.0), 1.0)
+        participation_rate = min(max(self._p("participation_rate"), 0.0), 1.0)
         if self.rng.random() > participation_rate:
             return "skipped_participation"
 

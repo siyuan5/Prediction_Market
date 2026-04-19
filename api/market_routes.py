@@ -33,6 +33,7 @@ for _p in (_ROOT / "app", _ROOT / "src"):
 
 from agent_runner import AgentRunner  # noqa: E402
 from market_service import MarketService  # noqa: E402
+from personality import DEFAULT_POPULATION_DIST, sample_personality  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,13 @@ def _agent_response_row(agent: Dict[str, Any]) -> Dict[str, Any]:
 @agents_router.post("/agents", status_code=201)
 def create_agent(body: AgentCreateRequest) -> Dict[str, Any]:
     svc = get_market_service()
-    personality_json = json.dumps(body.personality) if body.personality is not None else None
+    # Sample a personality at agent creation time so every agent has a
+    # fully-specified, market-independent personality from birth.
+    if body.personality is not None:
+        personality_dict = body.personality
+    else:
+        personality_dict = sample_personality(DEFAULT_POPULATION_DIST).to_dict()
+    personality_json = json.dumps(personality_dict)
     try:
         agent = svc.create_agent(
             body.name,
@@ -452,14 +459,15 @@ def get_one_agent(market_id: int, agent_id: int) -> Dict[str, Any]:
     ic = _market_initial_cash.get(market_id, 100.0)
     shares = float(pos.get("yes_shares") or 0.0)
     pnl = float(ag["cash"]) + shares * float(price) - ic
-    pers = pos.get("personality")
-    parsed: Any = _parse_personality(pers) if pers is not None else pers
+    # Belief and personality come from the global agent record, not the position,
+    # so that agent personalities remain independent of the markets they trade in.
+    parsed: Any = _parse_personality(ag.get("personality"))
     return {
         "agent_id": agent_id,
         "cash": float(ag["cash"]),
         "shares": shares,
-        "belief": float(pos["belief"]) if pos.get("belief") is not None else 0.5,
-        "rho": float(pos["rho"]) if pos.get("rho") is not None else 1.0,
+        "belief": float(ag["belief"]) if ag.get("belief") is not None else 0.5,
+        "rho": float(ag["rho"]) if ag.get("rho") is not None else 1.0,
         "pnl": pnl,
         "personality": parsed,
     }
