@@ -268,3 +268,30 @@ def test_two_market_start_stop_lifecycle_no_zombies(client, monkeypatch):
     assert [
         t.name for t in threading.enumerate() if t.name.startswith("agent-runner-")
     ] == []
+
+
+def test_market_detail_and_comment_tick(client):
+    mid = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "title": "Detail test", "ground_truth": 0.6, "b": 50.0},
+    ).json()["market_id"]
+    d = client.get(f"/api/market/{mid}/detail")
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["market_id"] == mid
+    assert body["title"] == "Detail test"
+    assert body["mechanism"] == "lmsr"
+    assert "price" in body
+
+    aid = _create_agent(client, name="c1", belief=0.55)["agent_id"]
+    client.post(f"/api/market/{mid}/join", json={"agent_id": aid})
+    client.post(
+        f"/api/market/{mid}/trade",
+        json={"agent_id": aid, "quantity": 2.0},
+    )
+    tick = client.post(f"/api/market/{mid}/comments/tick")
+    assert tick.status_code == 200, tick.text
+    assert tick.json()["appended"] == 1
+    cm = client.get(f"/api/market/{mid}/comments?since=0")
+    assert cm.status_code == 200, cm.text
+    assert cm.json()["total"] >= 1

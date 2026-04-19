@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -35,6 +36,8 @@ from agent_runner import AgentRunner  # noqa: E402
 from market_service import MarketService  # noqa: E402
 from personality import DEFAULT_POPULATION_DIST, sample_personality  # noqa: E402
 
+from .llm_comments import generate_comment_text, llm_budget_initial  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/market", tags=["market"])
@@ -47,6 +50,11 @@ _market_service: Optional[MarketService] = None
 _agent_runner: Optional[AgentRunner] = None
 # market_id -> metadata from create()
 _market_initial_cash: Dict[int, float] = {}
+# In-memory trader chat keyed by market (dev / UI; cleared on ``reset_market_runtime``).
+_market_comment_rows: Dict[int, List[Dict[str, Any]]] = {}
+_market_comment_llm_budget: Dict[int, List[int]] = {}
+_trade_cursor_for_comments: Dict[int, int] = {}
+_comment_id_seq: Dict[int, int] = {}
 
 
 def reset_market_runtime() -> None:
@@ -59,6 +67,10 @@ def reset_market_runtime() -> None:
         _market_service.close()
         _market_service = None
     _market_initial_cash.clear()
+    _market_comment_rows.clear()
+    _market_comment_llm_budget.clear()
+    _trade_cursor_for_comments.clear()
+    _comment_id_seq.clear()
 
 
 def _db_path() -> str:
@@ -323,6 +335,114 @@ def create_market(body: MarketCreateRequest) -> Dict[str, Any]:
         "ground_truth": body.ground_truth,
         "status": "open",
     }
+
+
+@router.get("/{market_id}/detail")
+def get_market_detail(market_id: int) -> Dict[str, Any]:
+    """Single-market summary for UI headers (title, status, volume)."""
+    svc = get_market_service()
+    try:
+        m = svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    summary = svc.list_markets_with_summary(status=None, limit=10_000, offset=0)
+    tc = 0
+    aa = 0
+    for row in summary["markets"]:
+        if int(row["id"]) == int(market_id):
+            tc = int(row.get("trade_count", 0))
+            aa = int(row.get("active_agents", 0))
+            break
+    price = float(svc.get_price(market_id))
+    return {
+        "market_id": int(market_id),
+        "title": str(m.get("title") or ""),
+        "slug": m.get("slug"),
+        "status": str(m.get("status") or ""),
+        "mechanism": str(m.get("mechanism") or ""),
+        "ground_truth": float(m.get("ground_truth") or 0.5),
+        "b": float(m.get("b") or 0.0),
+        "price": price,
+        "trade_count": tc,
+        "active_agents": aa,
+    }
+
+
+@router.get("/{market_id}/comments")
+def list_market_comments(market_id: int, since: int = 0) -> Dict[str, Any]:
+    """Return trader comments appended by ``POST .../comments/tick`` (newest last)."""
+    svc = get_market_service()
+    try:
+        svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    rows = _market_comment_rows.get(int(market_id), [])
+    out = [c for c in rows if int(c["id"]) > int(since)]
+    return {"comments": out, "total": len(rows)}
+
+
+@router.post("/{market_id}/comments/tick")
+def tick_market_comments(market_id: int) -> Dict[str, Any]:
+    """
+    If new trades exist since the last tick, append up to one LLM/template comment
+    for the oldest unseen trade (keeps Ollama load bounded).
+    """
+    svc = get_market_service()
+    try:
+        m = svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    mid = int(market_id)
+    last_c = _trade_cursor_for_comments.get(mid, 0)
+    batch = svc.get_trades(market_id=mid, since_trade_id=last_c, limit=50)
+    if not batch:
+        return {"appended": 0, "comments": []}
+    chronological = list(reversed(batch))
+    t = chronological[0]
+    tid = int(t["id"])
+    agent_id = int(t["agent_id"])
+    qty = float(t.get("shares") or 0.0)
+    if qty > 1e-9:
+        trade_flow = "buy_yes"
+    elif qty < -1e-9:
+        trade_flow = "sell_yes"
+    else:
+        trade_flow = "hold"
+    try:
+        ag = svc.get_agent(agent_id, None)
+        belief = float(ag.get("belief") or 0.5)
+    except ValueError:
+        belief = 0.5
+    price = float(t.get("price_after") or svc.get_price(mid))
+    if mid not in _market_comment_llm_budget:
+        _market_comment_llm_budget[mid] = [llm_budget_initial()]
+    rng = random.Random(tid * 17_389 + agent_id * 97 + mid)
+    title = str(m.get("title") or "Prediction market")
+    mech = str(m.get("mechanism") or "lmsr")
+    text, source = generate_comment_text(
+        event_name=title,
+        mechanism=mech,
+        belief=belief,
+        agent_id=agent_id,
+        round_num=tid,
+        market_yes_price=float(price),
+        trade_flow=trade_flow,
+        rng=rng,
+        llm_budget=_market_comment_llm_budget[mid],
+    )
+    seq = _comment_id_seq.get(mid, 0) + 1
+    _comment_id_seq[mid] = seq
+    row = {
+        "id": seq,
+        "trade_id": tid,
+        "agent_id": agent_id,
+        "text": text,
+        "source": source,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    _market_comment_rows.setdefault(mid, []).append(row)
+    _trade_cursor_for_comments[mid] = tid
+    return {"appended": 1, "comments": [row]}
 
 
 @router.get("/{market_id}/price")
