@@ -167,10 +167,32 @@ class AutonomousAgent:
             )
         return response.json()
 
-    def submit_trade(self, market_id: int, quantity: float) -> Optional[Dict[str, Any]]:
+    def submit_trade(
+        self,
+        market_id: int,
+        quantity: float,
+        mechanism: str = "lmsr",
+        limit_price: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        # LMSR takes signed quantity; CDA needs explicit side + order_type.
+        # for CDA, submit as a limit order at belief (slightly aggressive so
+        # crossing orders match). pure market orders would fail on empty books.
+        if mechanism == "cda":
+            side = "buy" if quantity >= 0 else "sell"
+            payload: Dict[str, Any] = {
+                "agent_id": self.agent_id,
+                "side": side,
+                "quantity": abs(float(quantity)),
+                "order_type": "limit" if limit_price is not None else "market",
+            }
+            if limit_price is not None:
+                payload["limit_price"] = float(limit_price)
+        else:
+            payload = {"agent_id": self.agent_id, "quantity": float(quantity)}
+
         response = self.session.post(
             self._url(f"/market/{market_id}/trade"),
-            json={"agent_id": self.agent_id, "quantity": float(quantity)},
+            json=payload,
             timeout=self.timeout,
         )
         if response.status_code == 409:
@@ -193,6 +215,7 @@ class AutonomousAgent:
             return "no_markets"
 
         market_id = int(market.get("id", market.get("market_id")))
+        mechanism = str(market.get("mechanism") or "lmsr").lower()
         price_snapshot = self.get_price_snapshot(market_id)
         agent_state = self.get_agent_state(market_id)
 
@@ -255,7 +278,18 @@ class AutonomousAgent:
         if abs(x_star) < 1e-9:
             return "trade_too_small"
 
-        trade_result = self.submit_trade(market_id, x_star)
+        # for CDA, agents post limit orders at their belief so there's resting
+        # liquidity; a small 0.01 cross toward price ensures matching orders fill
+        limit_price: Optional[float] = None
+        if mechanism == "cda":
+            if x_star >= 0:
+                limit_price = min(max(belief + 0.005, 0.01), 0.99)
+            else:
+                limit_price = min(max(belief - 0.005, 0.01), 0.99)
+
+        trade_result = self.submit_trade(
+            market_id, x_star, mechanism=mechanism, limit_price=limit_price
+        )
         if trade_result is None:
             return "retry"
 

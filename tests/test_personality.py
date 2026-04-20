@@ -308,7 +308,7 @@ class TestPersonalityFieldsBehavior:
         monkeypatch.setattr(agent, "list_open_markets", lambda: [{"id": 1, "price": 0.50}])
         monkeypatch.setattr(agent, "get_price_snapshot", lambda mid: {"price": 0.50})
         monkeypatch.setattr(agent, "get_agent_state", lambda mid: None)
-        monkeypatch.setattr(agent, "submit_trade", lambda mid, qty: {"agent_cash_after": 95.0, "agent_shares_after": 3.0})
+        monkeypatch.setattr(agent, "submit_trade", lambda mid, qty, mechanism="lmsr", limit_price=None: {"agent_cash_after": 95.0, "agent_shares_after": 3.0})
         result = agent.run_cycle()
         assert result == "traded"
 
@@ -332,7 +332,7 @@ class TestPersonalityFieldsBehavior:
 
         submitted_quantities = []
 
-        def capture_trade(mid, qty):
+        def capture_trade(mid, qty, mechanism="lmsr", limit_price=None):
             submitted_quantities.append(qty)
             return {"agent_cash_after": 90.0, "agent_shares_after": qty}
 
@@ -392,7 +392,7 @@ class TestPersonalityFieldsBehavior:
             monkeypatch.setattr(agent, "list_open_markets", lambda: [{"id": 1, "price": 0.50}])
             monkeypatch.setattr(agent, "get_price_snapshot", lambda mid: {"price": 0.50})
             monkeypatch.setattr(agent, "get_agent_state", lambda mid: market_state)
-            monkeypatch.setattr(agent, "submit_trade", lambda mid, qty: {"agent_cash_after": 90.0, "agent_shares_after": qty})
+            monkeypatch.setattr(agent, "submit_trade", lambda mid, qty, mechanism="lmsr", limit_price=None: {"agent_cash_after": 90.0, "agent_shares_after": qty})
             agent.run_cycle()
 
         # High sensitivity agent should move more toward 0.80
@@ -421,7 +421,7 @@ class TestPersonalityFieldsBehavior:
         monkeypatch.setattr(agent, "list_open_markets", lambda: [{"id": 1, "price": 0.50}])
         monkeypatch.setattr(agent, "get_price_snapshot", lambda mid: {"price": 0.50})
         monkeypatch.setattr(agent, "get_agent_state", lambda mid: market_state)
-        monkeypatch.setattr(agent, "submit_trade", lambda mid, qty: {"agent_cash_after": 90.0, "agent_shares_after": qty})
+        monkeypatch.setattr(agent, "submit_trade", lambda mid, qty, mechanism="lmsr", limit_price=None: {"agent_cash_after": 90.0, "agent_shares_after": qty})
         agent.run_cycle()
 
         # With stubbornness=0.99, influence = 1.0 * (1 - 0.99) = 0.01
@@ -447,7 +447,7 @@ class TestPersonalityFieldsBehavior:
         monkeypatch.setattr(agent, "list_open_markets", lambda: [{"id": 1, "price": 0.50}])
         monkeypatch.setattr(agent, "get_price_snapshot", lambda mid: {"price": 0.50})
         monkeypatch.setattr(agent, "get_agent_state", lambda mid: market_state)
-        monkeypatch.setattr(agent, "submit_trade", lambda mid, qty: {"agent_cash_after": 90.0, "agent_shares_after": qty})
+        monkeypatch.setattr(agent, "submit_trade", lambda mid, qty, mechanism="lmsr", limit_price=None: {"agent_cash_after": 90.0, "agent_shares_after": qty})
         agent.run_cycle()
 
         # With signal_sensitivity=0, no influence at all — belief must not change
