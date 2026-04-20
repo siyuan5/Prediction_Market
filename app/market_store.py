@@ -13,7 +13,7 @@ Usage:
     store = MarketStore("markets.db")             # file-backed
 
     mkt   = store.create_market("btc-100k", "BTC > $100k?",
-                                mechanism="lmsr", b=100.0, ground_truth=0.7)
+                                mechanism="lmsr", b=200.0, ground_truth=0.7)
     agent = store.create_agent(
         "alice",
         cash=1000.0,

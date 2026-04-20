@@ -23,12 +23,15 @@ export function MarketsHomePage() {
   const [title, setTitle] = useState("Will ETH close above $4k by Friday?");
   const [mechanism, setMechanism] = useState<"lmsr" | "cda">("lmsr");
   const [groundTruth, setGroundTruth] = useState(0.65);
-  const [b, setB] = useState(100);
+  const [b, setB] = useState(200);
   const [initialPrice, setInitialPrice] = useState(0.5);
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/markets?status=all&limit=200&offset=0");
+      const res = await fetch("/api/markets?status=all&limit=200&offset=0", {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+      });
       if (!res.ok) throw new Error(await res.text());
       const data = (await res.json()) as { markets: MarketRow[]; total: number };
       setMarkets(data.markets ?? []);
@@ -44,6 +47,37 @@ export function MarketsHomePage() {
     const id = window.setInterval(load, 2000);
     return () => window.clearInterval(id);
   }, [load]);
+
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  async function handleDeleteMarket(marketId: number, label: string) {
+    if (
+      !window.confirm(
+        `Delete market "${label}"? This removes the market, its trades, and positions. ` +
+          `Traders who only existed for this market are removed from the pool; others are kept.`,
+      )
+    ) {
+      return;
+    }
+    setDeletingId(marketId);
+    setError(null);
+    try {
+      const res = await fetch(`/api/market/${marketId}`, {
+        method: "DELETE",
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setMarkets((prev) => prev.filter((m) => (m.market_id ?? m.id ?? 0) !== marketId));
+      setTotal((t) => Math.max(0, t - 1));
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      await load();
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -156,22 +190,33 @@ export function MarketsHomePage() {
             const trades = m.trade_count_24h ?? m.trade_count ?? 0;
             const agents = m.active_agents_24h ?? m.active_agents ?? 0;
             const pct = Math.round((m.price ?? 0.5) * 1000) / 10;
+            const title = m.title || `Market #${id}`;
             return (
-              <Link key={id} to={`/market/${id}`} className="pm-market-card">
-                <div className="pm-card-top">
-                  <span className={`pm-status pm-status-${m.status}`}>{m.status}</span>
-                  <span className="pm-mech">{m.mechanism?.toUpperCase()}</span>
-                </div>
-                <h3 className="pm-card-title">{m.title || `Market #${id}`}</h3>
-                <div className="pm-card-yes">
-                  <span className="pm-yes-label">Yes</span>
-                  <span className="pm-yes-pct">{pct}%</span>
-                </div>
-                <div className="pm-card-meta">
-                  <span>{trades} trades</span>
-                  <span>{agents} active traders</span>
-                </div>
-              </Link>
+              <div key={id} className="pm-market-card-wrap">
+                <Link to={`/market/${id}`} className="pm-market-card">
+                  <div className="pm-card-top">
+                    <span className={`pm-status pm-status-${m.status}`}>{m.status}</span>
+                    <span className="pm-mech">{m.mechanism?.toUpperCase()}</span>
+                  </div>
+                  <h3 className="pm-card-title">{title}</h3>
+                  <div className="pm-card-yes">
+                    <span className="pm-yes-label">Yes</span>
+                    <span className="pm-yes-pct">{pct}%</span>
+                  </div>
+                  <div className="pm-card-meta">
+                    <span>{trades} trades</span>
+                    <span>{agents} active traders</span>
+                  </div>
+                </Link>
+                <button
+                  type="button"
+                  className="pm-btn-danger pm-card-delete"
+                  disabled={busy || deletingId === id}
+                  onClick={() => void handleDeleteMarket(id, title)}
+                >
+                  {deletingId === id ? "Deleting…" : "Delete"}
+                </button>
+              </div>
             );
           })
         )}

@@ -95,7 +95,7 @@ Updates global agent profile fields (`cash`, `belief`, `rho`, `personality`).
   "mechanism": "lmsr",
   "title": "Will ETH close above $4k by Friday?",
   "ground_truth": 0.70,
-  "b": 100.0
+  "b": 200.0
 }
 ```
 

@@ -23,7 +23,7 @@ class FakeAutonomousAgent:
     crash_once_agents: Set[int] = set()
     created_by_agent: Dict[int, int] = {}
 
-    def __init__(self, agent_id, api_base_url, personality, belief, rho, cash):
+    def __init__(self, agent_id, api_base_url, personality, belief, rho, cash, **kwargs):
         self.agent_id = int(agent_id)
         self._stop = threading.Event()
         FakeAutonomousAgent.created_by_agent[self.agent_id] = (

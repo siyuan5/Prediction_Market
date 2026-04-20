@@ -8,7 +8,7 @@ logic.
 
 Usage:
     svc = MarketService("markets.db")
-    mkt   = svc.create_market("btc-100k", "BTC > $100k?", mechanism="lmsr", b=100.0)
+    mkt   = svc.create_market("btc-100k", "BTC > $100k?", mechanism="lmsr", b=200.0)
     alice = svc.create_agent("alice", cash=1000.0)
     svc.set_market_status(mkt["id"], "running")
     trade = svc.execute_lmsr_trade(mkt["id"], alice["id"], quantity=5.0)
@@ -168,6 +168,22 @@ class MarketService:
     ) -> Dict[str, Any]:
         return self._get_store().list_agents(limit=limit, offset=offset)
 
+    def mean_belief_all_agents(self) -> Optional[float]:
+        """Mean belief across all agent rows (same roster as global ``/api/agents``)."""
+        data = self.list_agents(limit=1_000_000, offset=0)
+        beliefs: List[float] = []
+        for r in data["agents"]:
+            b = r.get("belief")
+            if b is None:
+                continue
+            try:
+                beliefs.append(float(b))
+            except (TypeError, ValueError):
+                continue
+        if not beliefs:
+            return None
+        return float(np.mean(beliefs))
+
     def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
         return self._get_store().get_position(agent_id, market_id)
 
@@ -239,6 +255,65 @@ class MarketService:
     def set_market_status(self, market_id: int, status: str) -> Dict[str, Any]:
         with self._begin_immediate():
             return self._get_store().set_market_status(market_id, status)
+
+    def delete_market(self, market_id: int) -> int:
+        """
+        Remove a market and all trades, orders, and positions for it.
+
+        Deletes **orphan** agent rows: agents who only ever participated in this
+        market (no remaining positions, trades, or open orders anywhere).
+
+        Returns:
+            Number of agent rows removed.
+        """
+        with self._begin_immediate():
+            store = self._get_store()
+            conn = store.conn
+            row = conn.execute("SELECT id FROM markets WHERE id = ?", (market_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"Market {market_id} not found")
+
+            involved = conn.execute(
+                """
+                SELECT DISTINCT agent_id FROM (
+                    SELECT agent_id FROM trades WHERE market_id = ?
+                    UNION SELECT agent_id FROM positions WHERE market_id = ?
+                    UNION SELECT agent_id FROM orders WHERE market_id = ?
+                )
+                """,
+                (market_id, market_id, market_id),
+            ).fetchall()
+            agent_ids = [int(r[0]) for r in involved]
+
+            conn.execute("DELETE FROM trades WHERE market_id = ?", (market_id,))
+            conn.execute("DELETE FROM orders WHERE market_id = ?", (market_id,))
+            conn.execute("DELETE FROM positions WHERE market_id = ?", (market_id,))
+            conn.execute("DELETE FROM markets WHERE id = ?", (market_id,))
+
+            removed = 0
+            for aid in agent_ids:
+                n_pos = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM positions WHERE agent_id = ?",
+                        (aid,),
+                    ).fetchone()[0]
+                )
+                n_tr = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM trades WHERE agent_id = ?",
+                        (aid,),
+                    ).fetchone()[0]
+                )
+                n_ord = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM orders WHERE agent_id = ? AND status = 'open'",
+                        (aid,),
+                    ).fetchone()[0]
+                )
+                if n_pos == 0 and n_tr == 0 and n_ord == 0:
+                    conn.execute("DELETE FROM agents WHERE id = ?", (aid,))
+                    removed += 1
+            return removed
 
     def set_agent_belief(self, market_id: int, agent_id: int, new_belief: float) -> float:
         with self._begin_immediate():

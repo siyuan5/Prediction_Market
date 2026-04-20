@@ -41,7 +41,7 @@ type CreateResponse = {
 
 export function AutonomousMarketPanel() {
   const [nAgents, setNAgents] = useState(12);
-  const [b, setB] = useState(100);
+  const [b, setB] = useState(200);
   const [groundTruth, setGroundTruth] = useState(0.65);
   const [seed, setSeed] = useState(42);
   const [title, setTitle] = useState("Live LMSR (autonomous)");

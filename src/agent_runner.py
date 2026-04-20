@@ -235,14 +235,22 @@ class AgentRunner:
             personality=personality,
         )
 
+    def _allowed_markets_for_agent(self, agent_id: int) -> Set[int]:
+        """Markets this runner has attached to the agent (thread-safe)."""
+        with self._lock:
+            st = self._agent_states.get(agent_id)
+            return set(st.markets) if st else set()
+
     def _start_agent_locked(self, seed: _AgentSeed, markets: Set[int]) -> None:
+        aid = seed.agent_id
         agent = self._agent_factory(
-            agent_id=seed.agent_id,
+            agent_id=aid,
             api_base_url=self._api_base_url,
             personality=seed.personality,
             belief=seed.belief,
             rho=seed.rho,
             cash=seed.cash,
+            allowed_market_ids=lambda: self._allowed_markets_for_agent(aid),
         )
         thread = threading.Thread(
             target=self._run_agent_loop,
@@ -335,6 +343,7 @@ class AgentRunner:
                         belief=seed.belief,
                         rho=seed.rho,
                         cash=seed.cash,
+                        allowed_market_ids=lambda: self._allowed_markets_for_agent(aid),
                     )
                     thread = threading.Thread(
                         target=self._run_agent_loop,

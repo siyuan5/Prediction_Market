@@ -89,7 +89,7 @@ class SimulateRequest(BaseModel):
     n_agents: int = Field(50, ge=2, le=500)
     n_rounds: int = Field(100, ge=1, le=2000)
     initial_cash: float = Field(100.0, gt=0)
-    b: float = Field(100.0, gt=0)
+    b: float = Field(200.0, gt=0)
     initial_price: float = Field(0.5, ge=0.01, le=0.99)
     belief_mode: Literal["gaussian", "uniform", "fixed", "bimodal"] = "gaussian"
     belief_sigma: float = Field(0.10, ge=0.0, le=0.5)

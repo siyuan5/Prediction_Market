@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import random
 import threading
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 
 import requests
 
@@ -45,6 +45,7 @@ class AutonomousAgent:
         timeout: float = 5.0,
         rng: Optional[random.Random] = None,
         logger: Optional[logging.Logger] = None,
+        allowed_market_ids: Optional[Callable[[], Set[int]]] = None,
     ):
         self.agent_id = int(agent_id)
         self.api_base_url = str(api_base_url).rstrip("/")
@@ -57,6 +58,8 @@ class AutonomousAgent:
         self.session = requests.Session()
         self._stop_flag = threading.Event()
         self._shares_by_market: Dict[int, float] = {}
+        # When set (by AgentRunner), only those markets are considered after discovery.
+        self._allowed_market_ids = allowed_market_ids
 
         # Normalise personality to a Personality dataclass so all 7 fields are
         # always present and typed — independent of whatever dict the caller passes.
@@ -102,6 +105,19 @@ class AutonomousAgent:
         if not isinstance(markets, list):
             raise RuntimeError("markets response must be a list or {\"markets\": [...]} payload")
         return markets
+
+    def _filter_to_allowed_markets(self, markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self._allowed_market_ids is None:
+            return markets
+        allowed = self._allowed_market_ids()
+        if not allowed:
+            return []
+        out: List[Dict[str, Any]] = []
+        for m in markets:
+            mid = int(m.get("id", m.get("market_id", -1)))
+            if mid in allowed:
+                out.append(m)
+        return out
 
     def _choose_market(self, markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not markets:
@@ -171,7 +187,7 @@ class AutonomousAgent:
         return response.json()
 
     def run_cycle(self) -> str:
-        markets = self.list_open_markets()
+        markets = self._filter_to_allowed_markets(self.list_open_markets())
         market = self._choose_market(markets)
         if market is None:
             return "no_markets"

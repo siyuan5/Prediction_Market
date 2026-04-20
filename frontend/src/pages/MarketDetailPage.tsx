@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
-import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 type Detail = {
   market_id: number;
   title: string;
   mechanism: string;
+  /** open | running | stopped | … */
   status: string;
   ground_truth: number;
   price: number;
   trade_count: number;
+  /** Distinct agents who have traded in this market (not “spawned” count). */
   active_agents: number;
 };
 
@@ -20,6 +22,10 @@ type PriceSnap = {
   best_ask: number | null;
   last_trade_price?: number | null;
   timestamp: string;
+  /** Hidden P(Yes) for this market (scenario). */
+  ground_truth?: number | null;
+  /** Mean belief over all agents in the DB (same idea as Classic “mean belief”). */
+  mean_belief?: number | null;
 };
 
 type TradeRow = {
@@ -39,6 +45,7 @@ type CommentRow = {
 };
 
 export function MarketDetailPage() {
+  const navigate = useNavigate();
   const { marketId: midParam } = useParams();
   const marketId = Number.parseInt(midParam ?? "", 10);
 
@@ -47,7 +54,9 @@ export function MarketDetailPage() {
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [book, setBook] = useState<{ bids: { price: number; quantity: number }[]; asks: { price: number; quantity: number }[] } | null>(null);
   const [comments, setComments] = useState<CommentRow[]>([]);
-  const [chartRows, setChartRows] = useState<{ t: number; p: number }[]>([]);
+  const [chartRows, setChartRows] = useState<
+    { t: number; mid: number; meanBelief: number | null; groundTruth: number | null }[]
+  >([]);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -60,18 +69,36 @@ export function MarketDetailPage() {
   const [newsBelief, setNewsBelief] = useState(0.75);
   const [newsFraction, setNewsFraction] = useState(0.5);
   const [newsMinSens, setNewsMinSens] = useState(0.5);
+  const [globalAgentTotal, setGlobalAgentTotal] = useState<number | null>(null);
+  const [spawnNotice, setSpawnNotice] = useState<string | null>(null);
+  /** From GET /trades ``total`` — authoritative count of rows in DB for this market. */
+  const [serverTradeTotal, setServerTradeTotal] = useState<number | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   const loadDetail = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
     try {
       const res = await fetch(`/api/market/${marketId}/detail`);
       if (!res.ok) throw new Error(await res.text());
-      setDetail((await res.json()) as Detail);
+      const d = (await res.json()) as Detail;
+      setDetail(d);
+      setRunning(d.status === "running");
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }, [marketId]);
+
+  const refreshGlobalAgentCount = useCallback(async () => {
+    try {
+      const res = await fetch("/api/agents?limit=1&offset=0");
+      if (!res.ok) return;
+      const j = (await res.json()) as { total: number };
+      setGlobalAgentTotal(typeof j.total === "number" ? j.total : null);
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const fetchPrice = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
@@ -80,8 +107,13 @@ export function MarketDetailPage() {
     const p = (await res.json()) as PriceSnap;
     setPrice(p);
     const t = Date.now();
+    const mid = Number(p.price);
+    const mb =
+      p.mean_belief != null && Number.isFinite(Number(p.mean_belief)) ? Number(p.mean_belief) : null;
+    const gt =
+      p.ground_truth != null && Number.isFinite(Number(p.ground_truth)) ? Number(p.ground_truth) : null;
     setChartRows((rows) => {
-      const next = [...rows, { t, p: p.price }];
+      const next = [...rows, { t, mid, meanBelief: mb, groundTruth: gt }];
       return next.slice(-240);
     });
   }, [marketId]);
@@ -92,7 +124,10 @@ export function MarketDetailPage() {
     const q = since > 0 ? `?since=${since}&limit=80` : "?limit=80";
     const res = await fetch(`/api/market/${marketId}/trades${q}`);
     if (!res.ok) throw new Error(await res.text());
-    const data = (await res.json()) as { trades: TradeRow[] };
+    const data = (await res.json()) as { trades: TradeRow[]; total?: number };
+    if (typeof data.total === "number") {
+      setServerTradeTotal(data.total);
+    }
     const batch = data.trades ?? [];
     if (batch.length === 0) return;
     setTrades((prev) => [...prev, ...batch].slice(-200));
@@ -131,9 +166,16 @@ export function MarketDetailPage() {
 
   useEffect(() => {
     void loadDetail();
+    void refreshGlobalAgentCount();
     const id = window.setInterval(loadDetail, 3000);
     return () => window.clearInterval(id);
-  }, [loadDetail]);
+  }, [loadDetail, refreshGlobalAgentCount]);
+
+  useEffect(() => {
+    setChartRows([]);
+    lastTradeIdRef.current = 0;
+    lastCommentIdRef.current = 0;
+  }, [marketId]);
 
   useEffect(() => {
     if (!Number.isFinite(marketId)) return;
@@ -236,6 +278,7 @@ export function MarketDetailPage() {
   async function handleStart() {
     setBusy(true);
     setError(null);
+    setSpawnNotice(null);
     try {
       const res = await fetch(`/api/market/${marketId}/start`, { method: "POST" });
       if (!res.ok) throw new Error(await res.text());
@@ -244,6 +287,34 @@ export function MarketDetailPage() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleDeleteMarket() {
+    if (!detail) return;
+    const label = detail.title || `Market #${marketId}`;
+    if (
+      !window.confirm(
+        `Delete "${label}"? This removes the market and its history. ` +
+          `Traders who only participated here are removed from the pool; others are kept.`,
+      )
+    ) {
+      return;
+    }
+    setDeleteBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/market/${marketId}`, {
+        method: "DELETE",
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+      });
+      if (!res.ok) throw new Error(await res.text());
+      navigate("/", { replace: true });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteBusy(false);
     }
   }
 
@@ -263,9 +334,14 @@ export function MarketDetailPage() {
   }
 
   async function spawnDemoAgents() {
-    if (!Number.isFinite(marketId) || !detail) return;
+    if (!Number.isFinite(marketId)) return;
+    if (!detail) {
+      setError("Market is still loading — wait a second and try again.");
+      return;
+    }
     setBusy(true);
     setError(null);
+    setSpawnNotice(null);
     const gt = detail.ground_truth;
     try {
       const tag = Date.now();
@@ -285,6 +361,8 @@ export function MarketDetailPage() {
         if (!res.ok) throw new Error(await res.text());
       }
       await loadDetail();
+      await refreshGlobalAgentCount();
+      setSpawnNotice(String(demoN));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -322,7 +400,9 @@ export function MarketDetailPage() {
     return chartRows.map((r, i) => ({
       i,
       sec: Math.round((r.t - t0) / 100) / 10,
-      yes: Math.round(r.p * 1000) / 10,
+      mid: Math.round(r.mid * 1000) / 10,
+      meanBelief: r.meanBelief != null ? Math.round(r.meanBelief * 1000) / 10 : null,
+      pStar: r.groundTruth != null ? Math.round(r.groundTruth * 1000) / 10 : null,
     }));
   }, [chartRows]);
 
@@ -334,7 +414,11 @@ export function MarketDetailPage() {
     );
   }
 
-  const yesPct = price ? Math.round(price.price * 1000) / 10 : null;
+  const midPct = price ? Math.round(Number(price.price) * 1000) / 10 : null;
+  const lastPrintPct =
+    price?.last_trade_price != null && Number.isFinite(Number(price.last_trade_price))
+      ? Math.round(Number(price.last_trade_price) * 1000) / 10
+      : null;
 
   return (
     <div className="pm-page pm-detail">
@@ -355,55 +439,102 @@ export function MarketDetailPage() {
           <h1 className="pm-detail-title">{detail?.title ?? "Loading…"}</h1>
           <p className="pm-muted">
             {detail?.mechanism?.toUpperCase()} · P* {(detail?.ground_truth ?? 0) * 100}% · {detail?.trade_count ?? 0}{" "}
-            trades · {detail?.active_agents ?? 0} traders
+            trades · {detail?.active_agents ?? 0} traders with prints here
+            {globalAgentTotal != null ? ` · ${globalAgentTotal} agents globally` : ""}
           </p>
+          {detail ? (
+            <button
+              type="button"
+              className="pm-btn-danger pm-detail-delete"
+              disabled={busy || deleteBusy}
+              onClick={() => void handleDeleteMarket()}
+            >
+              {deleteBusy ? "Deleting…" : "Delete market"}
+            </button>
+          ) : null}
         </div>
         <div className="pm-detail-yes-block" aria-live="polite">
-          <div className="pm-yes-huge-label">Chance · Yes</div>
-          <div className="pm-yes-huge">{yesPct != null ? `${yesPct}%` : "—"}</div>
+          <div className="pm-yes-huge-label">Implied Yes (LMSR mid)</div>
+          <div className="pm-yes-huge">{midPct != null ? `${midPct}%` : "—"}</div>
+          {lastPrintPct != null ? (
+            <div className="pm-ts">Last trade print: {lastPrintPct}%</div>
+          ) : null}
           {price?.timestamp ? <div className="pm-ts">{price.timestamp}</div> : null}
         </div>
       </header>
 
-      <div className="pm-toolbar">
-        <button type="button" className="pm-btn-primary" disabled={busy || running} onClick={handleStart}>
-          Start trading
-        </button>
-        <button type="button" className="pm-btn-danger" disabled={busy || !running} onClick={handleStop}>
-          Stop
-        </button>
-        <button type="button" className="pm-btn-secondary" disabled={busy} onClick={() => setShowNews(true)}>
-          News event
-        </button>
-      </div>
+      {spawnNotice ? (
+        <div className="pm-spawn-notice" role="status">
+          <p style={{ margin: 0 }}>
+            Created {spawnNotice} agents in the global pool. Trade count / “traders with prints” only update after actual
+            trades. <strong>Click Start trading</strong> below if you haven&apos;t — the chart stays flat until the
+            market is running.
+          </p>
+        </div>
+      ) : null}
 
-      <section className="pm-panel">
-        <h2>Prepare demo traders</h2>
-        <p className="pm-muted">
-          Creates global agents (not tied to this market) with beliefs noisy around P*. They discover markets via the
-          API when trading is running.
+      <section className="pm-panel pm-controls-panel">
+        <h2 className="pm-controls-title">Trading controls</h2>
+        <p className="pm-muted small" style={{ marginTop: 0 }}>
+          <strong>1.</strong> Spawn adds traders to the global pool. <strong>2.</strong>{" "}
+          <strong>Start trading</strong> turns on autonomous activity (nothing happens until then). With many agents,
+          different IDs will show in the feed over time—not only one.
         </p>
-        <div className="pm-inline">
-          <label>
-            Count
-            <input
-              type="number"
-              min={1}
-              max={200}
-              value={demoN}
-              onChange={(e) => setDemoN(Number(e.target.value))}
-              disabled={busy}
-            />
-          </label>
-          <button type="button" className="pm-btn-secondary" disabled={busy} onClick={spawnDemoAgents}>
-            Spawn agents
-          </button>
+        <div className="pm-controls-grid">
+          <div className="pm-control-block">
+            <span className="pm-control-label">Step 1 — Agents</span>
+            <div className="pm-inline">
+              <label>
+                Count
+                <input
+                  type="number"
+                  min={1}
+                  max={200}
+                  value={demoN}
+                  onChange={(e) => setDemoN(Number(e.target.value))}
+                  disabled={busy}
+                />
+              </label>
+              <button type="button" className="pm-btn-secondary" disabled={busy} onClick={spawnDemoAgents}>
+                Spawn agents
+              </button>
+            </div>
+          </div>
+          <div className="pm-control-block pm-control-primary">
+            <span className="pm-control-label">Step 2 — Autonomous engine</span>
+            <div className="pm-toolbar">
+              <button type="button" className="pm-btn-primary" disabled={busy || running} onClick={handleStart}>
+                Start trading
+              </button>
+              <button type="button" className="pm-btn-danger" disabled={busy || !running} onClick={handleStop}>
+                Stop
+              </button>
+              <button type="button" className="pm-btn-secondary" disabled={busy} onClick={() => setShowNews(true)}>
+                News event
+              </button>
+            </div>
+            {running ? (
+              <p className="pm-running-pill" aria-live="polite">
+                Running — autonomous traders are active for this market
+              </p>
+            ) : (
+              <p className="pm-muted small" style={{ margin: "0.35rem 0 0" }}>
+                Not running yet — press <strong>Start trading</strong> after spawning agents.
+              </p>
+            )}
+          </div>
         </div>
       </section>
 
       <div className="pm-two-col">
         <section className="pm-panel pm-grow">
           <h2>Live price</h2>
+          <p className="pm-muted small" style={{ marginTop: "-0.25rem", marginBottom: "0.5rem" }}>
+            <strong>Green</strong> = LMSR mid (inventory). <strong>Purple</strong> = mean belief over{" "}
+            <strong>every</strong> agent in the DB (global pool), like the roster—not only traders tied to this market.{" "}
+            <strong>Amber dashed</strong> = scenario P* (ground truth). Same idea as Classic &quot;Mean belief vs
+            price&quot;—mid can still pin near 0%/100% while beliefs sit near P*. Trade feed shows execution prices.
+          </p>
           <div className="pm-chart-wrap">
             {chartData.length === 0 ? (
               <p className="pm-muted">Waiting for price samples…</p>
@@ -412,8 +543,43 @@ export function MarketDetailPage() {
                 <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
                   <XAxis dataKey="sec" tick={{ fontSize: 11 }} stroke="#64748b" unit="s" />
                   <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11 }} stroke="#64748b" />
-                  <Tooltip formatter={(v: number) => [`${v}%`, "Yes"]} />
-                  <Line type="monotone" dataKey="yes" stroke="#22c55e" strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <Tooltip
+                    formatter={(v: number | string, name: string) => [
+                      typeof v === "number" ? `${v}%` : String(v),
+                      name,
+                    ]}
+                  />
+                  <Legend wrapperStyle={{ fontSize: "12px" }} />
+                  <Line
+                    type="monotone"
+                    dataKey="mid"
+                    name="LMSR mid"
+                    stroke="#22c55e"
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="meanBelief"
+                    name="Mean belief"
+                    stroke="#7c3aed"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="pStar"
+                    name="P* (ground truth)"
+                    stroke="#d97706"
+                    strokeWidth={2}
+                    strokeDasharray="6 4"
+                    dot={false}
+                    connectNulls
+                    isAnimationActive={false}
+                  />
                 </LineChart>
               </ResponsiveContainer>
             )}
@@ -452,6 +618,11 @@ export function MarketDetailPage() {
       <div className="pm-two-col">
         <section className="pm-panel">
           <h2>Trade feed</h2>
+          <p className="pm-muted small" style={{ marginTop: "-0.35rem", marginBottom: "0.5rem" }}>
+            Polls every 1s for new rows. If the <strong>server trade count</strong> below stops going up, the
+            simulator isn&apos;t placing new fills (often: price pinned near 0%/100%, agents out of cash, or personality
+            skips)—not a frozen UI.
+          </p>
           <div className="pm-feed" aria-live="polite">
             {trades.length === 0 ? (
               <span className="pm-muted">No trades yet.</span>
@@ -465,6 +636,17 @@ export function MarketDetailPage() {
               ))
             )}
           </div>
+          {serverTradeTotal != null ? (
+            <p className="pm-feed-meta" aria-live="polite">
+              Server trade count: <strong>{serverTradeTotal}</strong>
+              {trades.length > 0 ? (
+                <>
+                  {" "}
+                  · newest on this page: <span className="mono">#{trades[trades.length - 1]?.trade_id}</span>
+                </>
+              ) : null}
+            </p>
+          ) : null}
         </section>
 
         <section className="pm-panel">

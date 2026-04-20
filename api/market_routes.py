@@ -107,7 +107,7 @@ def get_agent_runner() -> AgentRunner:
 class MarketCreateRequest(BaseModel):
     mechanism: str = "lmsr"
     ground_truth: float = Field(0.70, ge=0.01, le=0.99)
-    b: float = Field(100.0, gt=0)
+    b: float = Field(200.0, gt=0)
     title: str = "Autonomous market"
     description: str = ""
     tick_size: float = 0.0001
@@ -337,6 +337,29 @@ def create_market(body: MarketCreateRequest) -> Dict[str, Any]:
     }
 
 
+@router.delete("/{market_id}")
+def delete_market_endpoint(market_id: int) -> Dict[str, Any]:
+    """Remove market row and dependent trades, orders, positions. Stops autonomous runner if active."""
+    mid = int(market_id)
+    runner = get_agent_runner()
+    if runner.is_running(mid):
+        try:
+            runner.stop_market(mid)
+        except ValueError:
+            pass
+    _market_initial_cash.pop(mid, None)
+    _market_comment_rows.pop(mid, None)
+    _market_comment_llm_budget.pop(mid, None)
+    _trade_cursor_for_comments.pop(mid, None)
+    _comment_id_seq.pop(mid, None)
+    svc = get_market_service()
+    try:
+        agents_removed = svc.delete_market(mid)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    return {"deleted": True, "market_id": mid, "agents_removed": agents_removed}
+
+
 @router.get("/{market_id}/detail")
 def get_market_detail(market_id: int) -> Dict[str, Any]:
     """Single-market summary for UI headers (title, status, volume)."""
@@ -464,6 +487,9 @@ def get_market_price(market_id: int) -> Dict[str, Any]:
             last_px = trades[0].get("price_after")
 
     ts = datetime.now(timezone.utc).isoformat()
+    m = svc.get_market(market_id)
+    ground_truth = float(m.get("ground_truth") or 0.5)
+    mean_belief = svc.mean_belief_all_agents()
     if snap.get("mechanism") == "lmsr":
         return {
             "market_id": market_id,
@@ -473,6 +499,8 @@ def get_market_price(market_id: int) -> Dict[str, Any]:
             "last_trade_price": last_px,
             "last_trade_at": last_at,
             "timestamp": ts,
+            "ground_truth": ground_truth,
+            "mean_belief": mean_belief,
         }
     return {
         "market_id": market_id,
@@ -482,6 +510,8 @@ def get_market_price(market_id: int) -> Dict[str, Any]:
         "last_trade_price": snap.get("last_trade_price"),
         "last_trade_at": last_at,
         "timestamp": ts,
+        "ground_truth": ground_truth,
+        "mean_belief": mean_belief,
     }
 
 

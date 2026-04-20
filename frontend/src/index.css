@@ -863,6 +863,77 @@ label.checkbox-row input[type="checkbox"] {
   color: #b91c1c;
 }
 
+.pm-controls-panel {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  box-shadow: 0 8px 32px rgba(15, 23, 42, 0.08);
+}
+
+.pm-controls-title {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.pm-controls-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  gap: 1rem 1.25rem;
+  align-items: start;
+}
+
+@media (max-width: 720px) {
+  .pm-controls-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.pm-control-label {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+
+.pm-control-primary {
+  padding: 0.5rem 0 0;
+  border-left: 1px solid var(--border-soft);
+  padding-left: 1rem;
+}
+
+@media (max-width: 720px) {
+  .pm-control-primary {
+    border-left: none;
+    padding-left: 0;
+    border-top: 1px solid var(--border-soft);
+    padding-top: 0.75rem;
+  }
+}
+
+.pm-running-pill {
+  margin: 0.5rem 0 0;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #166534;
+  background: #dcfce7;
+  border-radius: 8px;
+  padding: 0.35rem 0.65rem;
+  display: inline-block;
+}
+
+.pm-spawn-notice {
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+  border-radius: var(--radius-md);
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.85rem;
+  font-size: 0.88rem;
+}
+
 .pm-error {
   color: #b91c1c;
   font-size: 0.9rem;
@@ -900,6 +971,23 @@ label.checkbox-row input[type="checkbox"] {
 .pm-market-card:hover {
   transform: translateY(-2px);
   box-shadow: 0 8px 28px rgba(15, 23, 42, 0.1);
+}
+
+.pm-market-card-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.pm-card-delete {
+  align-self: flex-end;
+  font-size: 0.8rem;
+  padding: 0.35rem 0.7rem;
+}
+
+.pm-detail-delete {
+  margin-top: 0.65rem;
+  font-size: 0.82rem;
 }
 
 .pm-card-top {
@@ -1143,6 +1231,12 @@ label.checkbox-row input[type="checkbox"] {
 .pm-feed-row {
   padding: 0.35rem 0;
   border-bottom: 1px solid var(--border-soft);
+}
+
+.pm-feed-meta {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin: 0.5rem 0 0;
 }
 
 .pm-comment {

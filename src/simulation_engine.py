@@ -58,7 +58,7 @@ class SimulationEngine:
         rho_distribution: str = "discrete",
         belief_spec: Optional[BeliefSpec] = None,
         # lmsr-specific param
-        b: float = 100.0,
+        b: float = 200.0,
         # cda-specific params
         initial_price: float = 0.5,
         tick_size: float = 1e-4,

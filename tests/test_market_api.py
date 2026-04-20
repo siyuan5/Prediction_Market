@@ -77,6 +77,87 @@ def test_create_market_and_price_no_agent_spawn(client):
     assert "price" in body
     assert 0.0 < body["price"] < 1.0
     assert body.get("best_bid") is None
+    assert body.get("ground_truth") == pytest.approx(0.66)
+    assert body.get("mean_belief") is None
+
+
+def test_delete_market_removes_row_and_children(client):
+    r = client.post(
+        "/api/market/create",
+        json={
+            "mechanism": "lmsr",
+            "ground_truth": 0.55,
+            "b": 50.0,
+            "title": "to delete",
+        },
+    )
+    assert r.status_code == 201, r.text
+    mid = r.json()["market_id"]
+    aid = _create_agent(client, name="deltrader", belief=0.5)["agent_id"]
+    client.post(f"/api/market/{mid}/join", json={"agent_id": aid})
+    tr = client.post(f"/api/market/{mid}/trade", json={"agent_id": aid, "quantity": 1.0})
+    assert tr.status_code == 200, tr.text
+
+    d = client.delete(f"/api/market/{mid}")
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["deleted"] is True
+    assert body["market_id"] == mid
+    assert body.get("agents_removed") == 1
+
+    assert client.get(f"/api/market/{mid}/detail").status_code == 404
+    listed = client.get("/api/markets?status=all&limit=200&offset=0")
+    assert listed.status_code == 200
+    ids = [m.get("market_id") or m.get("id") for m in listed.json().get("markets", [])]
+    assert mid not in ids
+    pool = client.get("/api/agents?limit=500&offset=0")
+    assert pool.status_code == 200
+    assert not any(a["agent_id"] == aid for a in pool.json().get("agents", []))
+
+
+def test_delete_market_keeps_agent_with_second_market(client):
+    r1 = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "ground_truth": 0.5, "b": 40.0, "title": "m1"},
+    )
+    r2 = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "ground_truth": 0.5, "b": 40.0, "title": "m2"},
+    )
+    assert r1.status_code == 201 and r2.status_code == 201
+    mid1 = r1.json()["market_id"]
+    mid2 = r2.json()["market_id"]
+    aid = _create_agent(client, name="two-market-trader", belief=0.55)["agent_id"]
+    assert client.post(f"/api/market/{mid1}/join", json={"agent_id": aid}).status_code == 200
+    assert client.post(f"/api/market/{mid2}/join", json={"agent_id": aid}).status_code == 200
+
+    d = client.delete(f"/api/market/{mid1}")
+    assert d.status_code == 200, d.text
+    assert d.json().get("agents_removed") == 0
+
+    pool = client.get("/api/agents?limit=500&offset=0").json()
+    assert any(a["agent_id"] == aid for a in pool["agents"])
+
+
+def test_price_mean_belief_pools_all_agents(client):
+    _create_agent(client, name="m1", belief=0.5)
+    _create_agent(client, name="m2", belief=0.7)
+    r = client.post(
+        "/api/market/create",
+        json={
+            "mechanism": "lmsr",
+            "ground_truth": 0.72,
+            "b": 80.0,
+            "title": "mean belief test",
+        },
+    )
+    assert r.status_code == 201, r.text
+    mid = r.json()["market_id"]
+    pr = client.get(f"/api/market/{mid}/price")
+    assert pr.status_code == 200
+    body = pr.json()
+    assert body["ground_truth"] == pytest.approx(0.72)
+    assert body["mean_belief"] == pytest.approx(0.6)
 
 
 def test_agents_create_list_patch_and_alias(client):
@@ -193,7 +274,7 @@ def test_full_market_flow_with_news_injection(client):
 
 def test_two_market_start_stop_lifecycle_no_zombies(client, monkeypatch):
     class FakeAutonomousAgent:
-        def __init__(self, agent_id, api_base_url, personality, belief, rho, cash):
+        def __init__(self, agent_id, api_base_url, personality, belief, rho, cash, **kwargs):
             self.agent_id = int(agent_id)
             self._stop = threading.Event()
             self._tick = 0

@@ -252,7 +252,7 @@ const defaultPayload: SimulatePayload = {
   n_agents: 50,
   n_rounds: 120,
   initial_cash: 100,
-  b: 100,
+  b: 200,
   initial_price: 0.5,
   belief_mode: "gaussian",
   belief_sigma: 0.1,
