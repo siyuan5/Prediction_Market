@@ -236,6 +236,11 @@ class AutonomousAgent:
             rho=rho,
         )
 
+        # scale by trade_fraction to prevent buy/liquidate oscillation, matches
+        # the round-based simulation engine's trade_fraction=0.20 default
+        trade_fraction = min(max(self._p("trade_fraction"), 0.0), 1.0)
+        x_star *= trade_fraction
+
         trade_size_noise = min(max(self._p("trade_size_noise"), 0.0), 1.0)
         x_star *= self.rng.uniform(1.0 - trade_size_noise, 1.0 + trade_size_noise)
 

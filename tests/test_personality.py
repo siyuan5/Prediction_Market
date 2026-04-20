@@ -46,7 +46,7 @@ class TestPersonalityDefaults:
         assert p.signal_sensitivity == 0.50
         assert p.stubbornness == 0.30
 
-    def test_all_seven_fields_present(self):
+    def test_all_fields_present(self):
         fields = set(Personality.__dataclass_fields__)
         assert fields == {
             "check_interval_mean",
@@ -56,6 +56,7 @@ class TestPersonalityDefaults:
             "trade_size_noise",
             "signal_sensitivity",
             "stubbornness",
+            "trade_fraction",
         }
 
 
