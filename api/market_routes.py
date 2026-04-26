@@ -289,8 +289,12 @@ def list_global_agents(
 ) -> Dict[str, Any]:
     svc = get_market_service()
     data = svc.list_agents(limit=limit, offset=offset)
+    rows = [_agent_response_row(a) for a in data["agents"]]
+    means = svc.mean_belief_joined_markets_by_agent([int(a["agent_id"]) for a in rows])
+    for row in rows:
+        row["avg_joined_belief"] = means.get(int(row["agent_id"]))
     return {
-        "agents": [_agent_response_row(a) for a in data["agents"]],
+        "agents": rows,
         "total": int(data["total"]),
     }
 
@@ -303,7 +307,9 @@ def get_global_agent(agent_id: int) -> Dict[str, Any]:
         agent = svc.get_agent(agent_id)
     except ValueError as e:
         _http_from_value(e, not_found=True)
-    return _agent_response_row(agent)
+    row = _agent_response_row(agent)
+    row["avg_joined_belief"] = svc.mean_belief_joined_markets_by_agent([int(agent_id)]).get(int(agent_id))
+    return row
 
 
 @agents_router.get("/agents/{agent_id}/markets")
@@ -570,8 +576,8 @@ def tick_market_comments(market_id: int) -> Dict[str, Any]:
     else:
         trade_flow = "hold"
     try:
-        ag = svc.get_agent(agent_id, None)
-        belief = float(ag.get("belief") or 0.5)
+        pos = svc.get_position(agent_id, mid)
+        belief = float(pos.get("belief") or 0.5)
     except ValueError:
         belief = 0.5
     price = float(t.get("price_after") or svc.get_price(mid))
@@ -627,7 +633,7 @@ def get_market_price(market_id: int) -> Dict[str, Any]:
     ts = datetime.now(timezone.utc).isoformat()
     m = svc.get_market(market_id)
     ground_truth = float(m.get("ground_truth") or 0.5)
-    mean_belief = svc.mean_belief_all_agents()
+    mean_belief = svc.mean_belief_for_market(market_id)
     if snap.get("mechanism") == "lmsr":
         return {
             "market_id": market_id,
@@ -747,14 +753,13 @@ def get_one_agent(market_id: int, agent_id: int) -> Dict[str, Any]:
     ic = _market_initial_cash.get(market_id, 100.0)
     shares = float(pos.get("yes_shares") or 0.0)
     pnl = float(ag["cash"]) + shares * float(price) - ic
-    # Belief and personality come from the global agent record, not the position,
-    # so that agent personalities remain independent of the markets they trade in.
+    # Personality remains global, but belief is market-specific from the position.
     parsed: Any = _parse_personality(ag.get("personality"))
     return {
         "agent_id": agent_id,
         "cash": float(ag["cash"]),
         "shares": shares,
-        "belief": float(ag["belief"]) if ag.get("belief") is not None else 0.5,
+        "belief": float(pos["belief"]) if pos.get("belief") is not None else 0.5,
         "rho": float(ag["rho"]) if ag.get("rho") is not None else 1.0,
         "pnl": pnl,
         "personality": parsed,
@@ -827,14 +832,13 @@ def list_market_agents(
         svc.get_market(market_id)
     except ValueError as e:
         _http_from_value(e, not_found=True)
-    rows = svc.list_agents(limit=1_000_000, offset=0)["agents"]
+    rows = svc.list_agents_for_market(market_id)
     price = svc.get_price(market_id)
     ic = _market_initial_cash.get(market_id, 100.0)
     out: List[Dict[str, Any]] = []
     for r in rows[offset : offset + limit]:
-        aid = int(r["id"])
-        pos = svc.get_position(aid, market_id)
-        sh = float(pos.get("yes_shares") or 0)
+        aid = int(r["agent_id"])
+        sh = float(r.get("yes_shares") or 0)
         cash = float(r["cash"])
         bel = float(r["belief"]) if r.get("belief") is not None else 0.5
         rho = float(r["rho"]) if r.get("rho") is not None else 1.0
@@ -897,8 +901,8 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
     except ValueError as e:
         _http_from_value(e, not_found=True)
 
-    rows = svc.list_agents(limit=1_000_000, offset=0)["agents"]
-    by_id = {int(r["id"]): r for r in rows}
+    rows = svc.list_agents_for_market(market_id)
+    by_id = {int(r["agent_id"]): r for r in rows}
 
     selected: List[Dict[str, Any]] = []
     if body.agent_ids is not None:
@@ -922,7 +926,7 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
     else:
         scored: List[Tuple[float, int, Dict[str, Any]]] = []
         for row in rows:
-            aid = int(row["id"])
+            aid = int(row["agent_id"])
             personality = _parse_personality(row.get("personality"))
             sensitivity, stubbornness = _signal_profile(personality)
             if sensitivity + 1e-12 < body.min_signal_sensitivity:
@@ -939,7 +943,7 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
 
     changed: List[Dict[str, Any]] = []
     for row in selected:
-        aid = int(row["id"])
+        aid = int(row["agent_id"])
         old_belief = float(row["belief"]) if row.get("belief") is not None else 0.5
         personality = _parse_personality(row.get("personality"))
         sensitivity, stubbornness = _signal_profile(personality)

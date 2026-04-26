@@ -139,7 +139,7 @@ def test_delete_market_keeps_agent_with_second_market(client):
     assert any(a["agent_id"] == aid for a in pool["agents"])
 
 
-def test_price_mean_belief_pools_all_agents(client):
+def test_price_mean_belief_is_market_scoped(client):
     _create_agent(client, name="m1", belief=0.5)
     _create_agent(client, name="m2", belief=0.7)
     r = client.post(
@@ -157,7 +157,7 @@ def test_price_mean_belief_pools_all_agents(client):
     assert pr.status_code == 200
     body = pr.json()
     assert body["ground_truth"] == pytest.approx(0.72)
-    assert body["mean_belief"] == pytest.approx(0.6)
+    assert body["mean_belief"] is None
 
 
 def test_delete_agent_hides_from_ui_but_keeps_trade_history(client):
@@ -258,6 +258,11 @@ def test_full_market_flow_with_news_injection(client):
     )
     assert created.status_code == 201, created.text
     mid = created.json()["market_id"]
+    for row in created_agents:
+        assert client.post(
+            f"/api/market/{mid}/join",
+            json={"agent_id": int(row["agent_id"])},
+        ).status_code == 200
 
     markets = client.get("/api/markets")
     assert markets.status_code == 200, markets.text

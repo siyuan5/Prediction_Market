@@ -184,6 +184,49 @@ class MarketService:
             return None
         return float(np.mean(beliefs))
 
+    def mean_belief_for_market(self, market_id: int) -> Optional[float]:
+        """Mean belief across agents with a position in one market."""
+        rows = self.list_agents_for_market(market_id)
+        beliefs: List[float] = []
+        for r in rows:
+            b = r.get("belief")
+            if b is None:
+                continue
+            try:
+                beliefs.append(float(b))
+            except (TypeError, ValueError):
+                continue
+        if not beliefs:
+            return None
+        return float(np.mean(beliefs))
+
+    def mean_belief_joined_markets_by_agent(self, agent_ids: List[int]) -> Dict[int, Optional[float]]:
+        """
+        Mean position belief for each agent across all joined markets.
+
+        "Joined" means the agent has a row in ``positions`` for that market.
+        """
+        if not agent_ids:
+            return {}
+        ids = [int(x) for x in agent_ids]
+        out: Dict[int, Optional[float]] = {aid: None for aid in ids}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._get_store().conn.execute(
+            f"""
+            SELECT agent_id, AVG(belief) AS avg_belief
+            FROM positions
+            WHERE belief IS NOT NULL
+              AND agent_id IN ({placeholders})
+            GROUP BY agent_id
+            """,
+            ids,
+        ).fetchall()
+        for r in rows:
+            aid = int(r["agent_id"])
+            v = r["avg_belief"]
+            out[aid] = float(v) if v is not None else None
+        return out
+
     def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
         return self._get_store().get_position(agent_id, market_id)
 
@@ -210,7 +253,9 @@ class MarketService:
         store = self._get_store()
         rows = store.conn.execute(
             """
-            SELECT a.id AS agent_id, a.name, a.cash, a.belief, a.rho, a.personality,
+            SELECT a.id AS agent_id, a.name, a.cash,
+                   COALESCE(p.belief, a.belief) AS belief,
+                   a.rho, a.personality,
                    p.yes_shares
             FROM positions p
             JOIN agents a ON a.id = p.agent_id
@@ -381,7 +426,7 @@ class MarketService:
 
     def set_agent_belief(self, market_id: int, agent_id: int, new_belief: float) -> float:
         with self._begin_immediate():
-            return self._get_store().set_agent_belief(agent_id, new_belief)
+            return self._get_store().set_agent_belief(agent_id, market_id, new_belief)
 
     def update_agent_portfolio(
         self, market_id: int, agent_id: int, cash_delta: float, shares_delta: float,

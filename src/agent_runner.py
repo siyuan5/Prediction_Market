@@ -90,6 +90,10 @@ class AgentRunner:
             for row in rows:
                 seed = self._seed_from_row(row)
                 aid = seed.agent_id
+                # Ensure market-specific state exists before autonomous loops start.
+                # This initializes per-market belief (with deterministic noise) so
+                # agents are not all anchored to a neutral 0.5 fallback.
+                self._market_service.ensure_position(aid, market_id)
                 started_agent_ids.add(aid)
                 state = self._agent_states.get(aid)
                 if state is None:
@@ -208,10 +212,14 @@ class AgentRunner:
             self._ensure_monitor_locked()
             state = self._agent_states.get(aid)
             if state is None:
+                for mid in running_markets:
+                    self._market_service.ensure_position(aid, mid)
                 self._start_agent_locked(seed, running_markets)
             else:
                 state.markets.update(running_markets)
                 state.stop_requested = False
+                for mid in running_markets:
+                    self._market_service.ensure_position(aid, mid)
             for mid in running_markets:
                 self._market_agents[mid].add(aid)
 

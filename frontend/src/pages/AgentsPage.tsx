@@ -6,10 +6,11 @@ type AgentRow = {
   name: string;
   cash: number;
   belief: number | null;
+  avg_joined_belief?: number | null;
   rho: number | null;
 };
 
-type SortKey = "agent_id" | "name" | "belief" | "cash" | "rho";
+type SortKey = "agent_id" | "name" | "avg_joined_belief" | "cash" | "rho";
 
 export function AgentsPage() {
   const navigate = useNavigate();
@@ -17,8 +18,6 @@ export function AgentsPage() {
   const [error, setError] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("agent_id");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
-  const [edits, setEdits] = useState<Record<number, string>>({});
-  const [busyId, setBusyId] = useState<number | null>(null);
   const [deleteBusyId, setDeleteBusyId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
@@ -62,32 +61,6 @@ export function AgentsPage() {
     }
   }
 
-  async function applyBelief(agentId: number) {
-    const raw = edits[agentId]?.trim();
-    if (raw === undefined || raw === "") return;
-    const v = Number.parseFloat(raw);
-    if (!Number.isFinite(v) || v < 0.01 || v > 0.99) {
-      setError("Belief must be between 0.01 and 0.99");
-      return;
-    }
-    setBusyId(agentId);
-    setError(null);
-    try {
-      const res = await fetch(`/api/agents/${agentId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ belief: v }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      setEdits((e) => ({ ...e, [agentId]: "" }));
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusyId(null);
-    }
-  }
-
   async function deleteAgent(agentId: number, name: string) {
     if (!window.confirm(`Delete agent "${name}"? Trade history stays in the database.`)) return;
     setDeleteBusyId(agentId);
@@ -111,7 +84,7 @@ export function AgentsPage() {
         <span>Agents</span>
       </nav>
       <h1 className="pm-title">Agents</h1>
-      <p className="pm-sub">Global trader roster · PATCH belief for manual shocks</p>
+      <p className="pm-sub">Global trader roster · average belief across all joined markets</p>
 
       {error ? (
         <p className="pm-error" role="alert">
@@ -134,8 +107,8 @@ export function AgentsPage() {
                 </button>
               </th>
               <th>
-                <button type="button" className="pm-th-btn" onClick={() => toggleSort("belief")}>
-                  Belief {sortKey === "belief" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                <button type="button" className="pm-th-btn" onClick={() => toggleSort("avg_joined_belief")}>
+                  Avg joined belief {sortKey === "avg_joined_belief" ? (sortDir === "asc" ? "↑" : "↓") : ""}
                 </button>
               </th>
               <th>
@@ -148,7 +121,6 @@ export function AgentsPage() {
                   Cash {sortKey === "cash" ? (sortDir === "asc" ? "↑" : "↓") : ""}
                 </button>
               </th>
-              <th>Set belief</th>
               <th>Delete</th>
             </tr>
           </thead>
@@ -165,27 +137,9 @@ export function AgentsPage() {
                     {a.name}
                   </Link>
                 </td>
-                <td>{a.belief != null ? `${(a.belief * 100).toFixed(1)}%` : "—"}</td>
+                <td>{a.avg_joined_belief != null ? `${(a.avg_joined_belief * 100).toFixed(1)}%` : "—"}</td>
                 <td>{a.rho != null ? a.rho.toFixed(2) : "—"}</td>
                 <td>${a.cash?.toFixed(2) ?? "—"}</td>
-                <td onClick={(e) => e.stopPropagation()}>
-                  <div className="pm-inline tight">
-                    <input
-                      className="pm-input-sm"
-                      placeholder="0–1"
-                      value={edits[a.agent_id] ?? ""}
-                      onChange={(e) => setEdits((x) => ({ ...x, [a.agent_id]: e.target.value }))}
-                    />
-                    <button
-                      type="button"
-                      className="pm-btn-secondary"
-                      disabled={busyId === a.agent_id}
-                      onClick={() => applyBelief(a.agent_id)}
-                    >
-                      Apply
-                    </button>
-                  </div>
-                </td>
                 <td onClick={(e) => e.stopPropagation()}>
                   <button
                     type="button"

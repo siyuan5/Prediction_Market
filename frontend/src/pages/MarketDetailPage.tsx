@@ -24,7 +24,7 @@ type PriceSnap = {
   timestamp: string;
   /** Hidden P(Yes) for this market (scenario). */
   ground_truth?: number | null;
-  /** Mean belief over all agents in the DB (same idea as Classic “mean belief”). */
+  /** Mean belief across agents participating in this market. */
   mean_belief?: number | null;
 };
 
@@ -383,20 +383,18 @@ export function MarketDetailPage() {
     setBusy(true);
     setError(null);
     setSpawnNotice(null);
-    const gt = detail.ground_truth;
     try {
       const tag = Date.now();
       for (let i = 0; i < demoN; i += 1) {
-        const beliefNoise = (Math.random() - 0.5) * 0.2;
-        const belief = Math.min(0.99, Math.max(0.01, gt + beliefNoise));
+        // Sample heterogeneous risk aversion so spawned agents are not identical.
+        const rho = 0.5 + Math.random() * 1.5;
         const res = await fetch("/api/agents", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             name: `trader-${tag}-${i}`,
             cash: 100.0,
-            belief,
-            rho: 1.0,
+            rho: Math.round(rho * 100) / 100,
           }),
         });
         if (!res.ok) throw new Error(await res.text());
@@ -586,8 +584,8 @@ export function MarketDetailPage() {
         <section className="pm-panel pm-grow">
           <h2>Live price</h2>
           <p className="pm-muted small" style={{ marginTop: "-0.25rem", marginBottom: "0.5rem" }}>
-            <strong>Green</strong> = LMSR mid (inventory). <strong>Purple</strong> = mean belief over{" "}
-            <strong>every</strong> agent in the DB (global pool), like the roster—not only traders tied to this market.{" "}
+            <strong>Green</strong> = LMSR mid (inventory). <strong>Purple</strong> = mean belief over agents in this
+            market.{" "}
             <strong>Amber dashed</strong> = scenario P* (ground truth). Same idea as Classic &quot;Mean belief vs
             price&quot;—mid can still pin near 0%/100% while beliefs sit near P*. Trade feed shows execution prices.
           </p>
