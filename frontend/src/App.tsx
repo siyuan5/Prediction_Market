@@ -1,5 +1,6 @@
 import { NavLink, Route, Routes } from "react-router-dom";
 import { ClassicDashboard } from "./ClassicDashboard";
+import { AgentDetailPage } from "./pages/AgentDetailPage";
 import { AgentsPage } from "./pages/AgentsPage";
 import { MarketDetailPage } from "./pages/MarketDetailPage";
 import { MarketsHomePage } from "./pages/MarketsHomePage";
@@ -23,6 +24,7 @@ function Layout() {
           <Route path="/" element={<MarketsHomePage />} />
           <Route path="/market/:marketId" element={<MarketDetailPage />} />
           <Route path="/agents" element={<AgentsPage />} />
+          <Route path="/agents/:agentId" element={<AgentDetailPage />} />
           <Route path="/classic" element={<ClassicDashboard />} />
         </Routes>
       </main>

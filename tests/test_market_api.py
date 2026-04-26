@@ -376,3 +376,44 @@ def test_market_detail_and_comment_tick(client):
     cm = client.get(f"/api/market/{mid}/comments?since=0")
     assert cm.status_code == 200, cm.text
     assert cm.json()["total"] >= 1
+
+
+def test_agent_detail_activity_endpoints(client):
+    aid = _create_agent(client, name="profiled-agent", belief=0.58)["agent_id"]
+    mid = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "title": "Agent activity market", "ground_truth": 0.6, "b": 50.0},
+    ).json()["market_id"]
+    assert client.post(f"/api/market/{mid}/join", json={"agent_id": aid}).status_code == 200
+    trade = client.post(f"/api/market/{mid}/trade", json={"agent_id": aid, "quantity": 2.0})
+    assert trade.status_code == 200, trade.text
+    assert client.post(f"/api/market/{mid}/comments/tick").status_code == 200
+
+    profile = client.get(f"/api/agents/{aid}")
+    assert profile.status_code == 200, profile.text
+    assert profile.json()["name"] == "profiled-agent"
+
+    market_agent = client.get(f"/api/market/{mid}/agent/{aid}").json()
+    markets = client.get(f"/api/agents/{aid}/markets")
+    assert markets.status_code == 200, markets.text
+    market_rows = markets.json()["markets"]
+    assert len(market_rows) == 1
+    assert market_rows[0]["market_id"] == mid
+    assert market_rows[0]["title"] == "Agent activity market"
+    assert market_rows[0]["trade_count"] == 1
+    assert market_rows[0]["unrealized_pnl"] == pytest.approx(market_agent["pnl"])
+
+    trades = client.get(f"/api/agents/{aid}/trades")
+    assert trades.status_code == 200, trades.text
+    trade_rows = trades.json()["trades"]
+    assert len(trade_rows) == 1
+    assert trade_rows[0]["market_id"] == mid
+    assert trade_rows[0]["market_title"] == "Agent activity market"
+    assert trade_rows[0]["quantity"] == pytest.approx(2.0)
+
+    comments = client.get(f"/api/agents/{aid}/comments")
+    assert comments.status_code == 200, comments.text
+    comment_rows = comments.json()["comments"]
+    assert len(comment_rows) == 1
+    assert comment_rows[0]["market_id"] == mid
+    assert comment_rows[0]["text"]

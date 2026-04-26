@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
 type AgentRow = {
   agent_id: number;
@@ -12,6 +12,7 @@ type AgentRow = {
 type SortKey = "agent_id" | "name" | "belief" | "cash" | "rho";
 
 export function AgentsPage() {
+  const navigate = useNavigate();
   const [agents, setAgents] = useState<AgentRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("agent_id");
@@ -136,13 +137,21 @@ export function AgentsPage() {
           </thead>
           <tbody>
             {sorted.map((a) => (
-              <tr key={a.agent_id}>
+              <tr
+                key={a.agent_id}
+                className="pm-clickable-row"
+                onClick={() => navigate(`/agents/${a.agent_id}`)}
+              >
                 <td>{a.agent_id}</td>
-                <td>{a.name}</td>
+                <td>
+                  <Link to={`/agents/${a.agent_id}`} onClick={(e) => e.stopPropagation()}>
+                    {a.name}
+                  </Link>
+                </td>
                 <td>{a.belief != null ? `${(a.belief * 100).toFixed(1)}%` : "—"}</td>
                 <td>{a.rho != null ? a.rho.toFixed(2) : "—"}</td>
                 <td>${a.cash?.toFixed(2) ?? "—"}</td>
-                <td>
+                <td onClick={(e) => e.stopPropagation()}>
                   <div className="pm-inline tight">
                     <input
                       className="pm-input-sm"

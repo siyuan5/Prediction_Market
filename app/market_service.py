@@ -221,6 +221,46 @@ class MarketService:
         ).fetchall()
         return [{k: r[k] for k in r.keys()} for r in rows]
 
+    def list_markets_for_agent(self, agent_id: int) -> List[Dict[str, Any]]:
+        """
+        Return markets where an agent has a position row or at least one trade.
+
+        The detail page needs this cross-market view, but positions alone are
+        not enough because older trades may exist even if a position row was
+        later flattened to zero shares.
+        """
+        self.get_agent(agent_id)
+        store = self._get_store()
+        rows = store.conn.execute(
+            """
+            WITH agent_market_ids AS (
+                SELECT market_id FROM positions WHERE agent_id = ?
+                UNION
+                SELECT market_id FROM trades WHERE agent_id = ?
+            )
+            SELECT
+                m.*,
+                COALESCE(p.yes_shares, 0.0) AS yes_shares,
+                (
+                    SELECT COUNT(*)
+                    FROM trades t
+                    WHERE t.market_id = m.id AND t.agent_id = ?
+                ) AS trade_count,
+                (
+                    SELECT MAX(t.created_at)
+                    FROM trades t
+                    WHERE t.market_id = m.id AND t.agent_id = ?
+                ) AS last_trade_at
+            FROM agent_market_ids ami
+            JOIN markets m ON m.id = ami.market_id
+            LEFT JOIN positions p
+                ON p.market_id = m.id AND p.agent_id = ?
+            ORDER BY COALESCE(last_trade_at, m.created_at) DESC, m.id DESC
+            """,
+            (agent_id, agent_id, agent_id, agent_id, agent_id),
+        ).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
     # ── Write operations (delegate with BEGIN IMMEDIATE) ──────────────
 
     def create_market(

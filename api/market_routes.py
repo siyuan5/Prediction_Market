@@ -233,6 +233,22 @@ def _agent_response_row(agent: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _trade_response_row(t: Dict[str, Any], market_titles: Optional[Dict[int, str]] = None) -> Dict[str, Any]:
+    market_id = int(t["market_id"])
+    return {
+        "trade_id": str(t["id"]),
+        "market_id": market_id,
+        "market_title": (market_titles or {}).get(market_id),
+        "agent_id": int(t["agent_id"]),
+        "side": t.get("side"),
+        "quantity": float(t["shares"]),
+        "price": float(t["price_after"]),
+        "price_before": float(t["price_before"]),
+        "cost": float(t["cost"]),
+        "at": t.get("created_at"),
+    }
+
+
 # --- Routes ---
 
 
@@ -277,6 +293,110 @@ def list_global_agents(
         "agents": [_agent_response_row(a) for a in data["agents"]],
         "total": int(data["total"]),
     }
+
+
+@agents_router.get("/agents/{agent_id}")
+def get_global_agent(agent_id: int) -> Dict[str, Any]:
+    """Return one global agent profile row."""
+    svc = get_market_service()
+    try:
+        agent = svc.get_agent(agent_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    return _agent_response_row(agent)
+
+
+@agents_router.get("/agents/{agent_id}/markets")
+def list_agent_markets(agent_id: int) -> Dict[str, Any]:
+    """Return markets where an agent has joined or traded, with mark-to-market PnL."""
+    svc = get_market_service()
+    try:
+        agent = svc.get_agent(agent_id)
+        rows = svc.list_markets_for_agent(agent_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+
+    cash = float(agent["cash"])
+    markets: List[Dict[str, Any]] = []
+    total_pnl = 0.0
+    for row in rows:
+        mid = int(row["id"])
+        shares = float(row.get("yes_shares") or 0.0)
+        price = float(svc.get_price(mid))
+        ic = _market_initial_cash.get(mid, 100.0)
+        pnl = cash + shares * price - ic
+        total_pnl += pnl
+        markets.append(
+            {
+                "market_id": mid,
+                "title": str(row.get("title") or ""),
+                "status": str(row.get("status") or ""),
+                "mechanism": str(row.get("mechanism") or ""),
+                "position": shares,
+                "price": price,
+                "unrealized_pnl": pnl,
+                "trade_count": int(row.get("trade_count") or 0),
+                "last_trade_at": row.get("last_trade_at"),
+            }
+        )
+    return {"markets": markets, "total": len(markets), "total_pnl": total_pnl}
+
+
+@agents_router.get("/agents/{agent_id}/trades")
+def list_agent_trades(
+    agent_id: int,
+    since: Optional[int] = Query(None, description="Only trades with id > since"),
+    limit: int = Query(500, ge=1, le=2000),
+) -> Dict[str, Any]:
+    """Return cross-market trade history for one agent."""
+    svc = get_market_service()
+    try:
+        svc.get_agent(agent_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+
+    rows = svc.get_trades(agent_id=agent_id, since_trade_id=since, limit=limit)
+    market_ids = sorted({int(t["market_id"]) for t in rows})
+    titles: Dict[int, str] = {}
+    for mid in market_ids:
+        try:
+            titles[mid] = str(svc.get_market(mid).get("title") or f"Market #{mid}")
+        except ValueError:
+            titles[mid] = f"Market #{mid}"
+    return {
+        "trades": [_trade_response_row(t, titles) for t in rows],
+        "total": len(rows),
+    }
+
+
+@agents_router.get("/agents/{agent_id}/comments")
+def list_agent_comments(agent_id: int) -> Dict[str, Any]:
+    """Return in-memory trader-chat comments authored by one agent across markets."""
+    svc = get_market_service()
+    try:
+        svc.get_agent(agent_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+
+    comments: List[Dict[str, Any]] = []
+    for mid, rows in _market_comment_rows.items():
+        title = f"Market #{mid}"
+        try:
+            title = str(svc.get_market(mid).get("title") or title)
+        except ValueError:
+            pass
+        for row in rows:
+            if int(row.get("agent_id") or -1) != int(agent_id):
+                continue
+            comments.append(
+                {
+                    **row,
+                    "market_id": int(mid),
+                    "market_title": title,
+                }
+            )
+    comments.sort(key=lambda c: str(c.get("at") or ""), reverse=True)
+    return {"comments": comments, "total": len(comments)}
 
 
 @agents_router.patch("/agents/{agent_id}")
