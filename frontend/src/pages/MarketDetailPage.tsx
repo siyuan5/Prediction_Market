@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 type Detail = {
   market_id: number;
@@ -44,6 +44,19 @@ type CommentRow = {
   at?: string;
 };
 
+type NewsEventRow = {
+  id: number;
+  market_id: number;
+  headline: string;
+  mode: string;
+  requested_new_belief?: number | null;
+  requested_delta?: number | null;
+  n_affected: number;
+  mean_belief_before: number;
+  mean_belief_after: number;
+  at_timestamp: string;
+};
+
 export function MarketDetailPage() {
   const navigate = useNavigate();
   const { marketId: midParam } = useParams();
@@ -74,6 +87,7 @@ export function MarketDetailPage() {
   /** From GET /trades ``total`` — authoritative count of rows in DB for this market. */
   const [serverTradeTotal, setServerTradeTotal] = useState<number | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  const [newsHistory, setNewsHistory] = useState<NewsEventRow[]>([]);
 
   const loadDetail = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
@@ -156,6 +170,14 @@ export function MarketDetailPage() {
     if (batch.length === 0) return;
     setComments((prev) => [...prev, ...batch].slice(-120));
     lastCommentIdRef.current = Math.max(since, ...batch.map((c) => c.id));
+  }, [marketId]);
+
+  const fetchNewsHistory = useCallback(async () => {
+    if (!Number.isFinite(marketId)) return;
+    const res = await fetch(`/api/market/${marketId}/news?limit=200&offset=0`);
+    if (!res.ok) return;
+    const data = (await res.json()) as { events: NewsEventRow[] };
+    setNewsHistory(data.events ?? []);
   }, [marketId]);
 
   const tickComments = useCallback(async () => {
@@ -275,6 +297,25 @@ export function MarketDetailPage() {
     };
   }, [marketId, tickComments]);
 
+  useEffect(() => {
+    if (!Number.isFinite(marketId)) return;
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) return;
+      try {
+        await fetchNewsHistory();
+      } catch {
+        /* ignore */
+      }
+    };
+    void run();
+    const id = window.setInterval(run, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [marketId, fetchNewsHistory]);
+
   async function handleStart() {
     setBusy(true);
     setError(null);
@@ -387,6 +428,7 @@ export function MarketDetailPage() {
       if (!res.ok) throw new Error(await res.text());
       setShowNews(false);
       await fetchPrice();
+      await fetchNewsHistory();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -405,6 +447,20 @@ export function MarketDetailPage() {
       pStar: r.groundTruth != null ? Math.round(r.groundTruth * 1000) / 10 : null,
     }));
   }, [chartRows]);
+
+  const newsMarkers = useMemo(() => {
+    if (chartRows.length === 0 || newsHistory.length === 0) return [];
+    const t0 = chartRows[0].t;
+    return newsHistory
+      .map((ev) => {
+        const ts = Date.parse(ev.at_timestamp);
+        if (!Number.isFinite(ts)) return null;
+        const sec = Math.round(((ts - t0) / 1000) * 10) / 10;
+        return { id: ev.id, sec, headline: ev.headline };
+      })
+      .filter((x): x is { id: number; sec: number; headline: string } => x != null)
+      .filter((x) => x.sec >= 0);
+  }, [chartRows, newsHistory]);
 
   if (!Number.isFinite(marketId)) {
     return (
@@ -550,6 +606,15 @@ export function MarketDetailPage() {
                     ]}
                   />
                   <Legend wrapperStyle={{ fontSize: "12px" }} />
+                  {newsMarkers.map((m) => (
+                    <ReferenceLine
+                      key={`news-${m.id}`}
+                      x={m.sec}
+                      stroke="#dc2626"
+                      strokeDasharray="3 3"
+                      label={{ value: "News", position: "insideTopRight", fill: "#dc2626", fontSize: 10 }}
+                    />
+                  ))}
                   <Line
                     type="monotone"
                     dataKey="mid"
@@ -668,6 +733,23 @@ export function MarketDetailPage() {
           </div>
         </section>
       </div>
+
+      <section className="pm-panel">
+        <h2>News history</h2>
+        {newsHistory.length === 0 ? (
+          <p className="pm-muted">No news events yet.</p>
+        ) : (
+          <div className="pm-feed" aria-live="polite">
+            {newsHistory.map((ev) => (
+              <div key={ev.id} className="pm-feed-row">
+                <strong>{new Date(ev.at_timestamp).toLocaleString()}</strong> · {ev.headline} · affected{" "}
+                {ev.n_affected} agents · mean belief {(ev.mean_belief_before * 100).toFixed(1)}% to{" "}
+                {(ev.mean_belief_after * 100).toFixed(1)}%
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       {showNews ? (
         <div className="pm-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="news-title">

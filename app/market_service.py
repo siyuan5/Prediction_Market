@@ -214,7 +214,7 @@ class MarketService:
                    p.yes_shares
             FROM positions p
             JOIN agents a ON a.id = p.agent_id
-            WHERE p.market_id = ?
+            WHERE p.market_id = ? AND a.deleted_at IS NULL
             ORDER BY a.id
             """,
             (market_id,),
@@ -328,6 +328,7 @@ class MarketService:
             conn.execute("DELETE FROM trades WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM orders WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM positions WHERE market_id = ?", (market_id,))
+            conn.execute("DELETE FROM news_events WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM markets WHERE id = ?", (market_id,))
 
             removed = 0
@@ -351,9 +352,32 @@ class MarketService:
                     ).fetchone()[0]
                 )
                 if n_pos == 0 and n_tr == 0 and n_ord == 0:
-                    conn.execute("DELETE FROM agents WHERE id = ?", (aid,))
+                    now = datetime.now(timezone.utc).isoformat()
+                    conn.execute("UPDATE agents SET deleted_at = ? WHERE id = ?", (now, aid))
                     removed += 1
             return removed
+
+    def delete_agent(self, agent_id: int) -> Dict[str, Any]:
+        """
+        Soft-delete one agent so they disappear from UI/API lists, while keeping
+        their historical trades in the DB.
+        """
+        with self._begin_immediate():
+            store = self._get_store()
+            deleted = store.soft_delete_agent(agent_id)
+            conn = store.conn
+            conn.execute(
+                "UPDATE orders SET status = 'cancelled' WHERE agent_id = ? AND status = 'open'",
+                (agent_id,),
+            )
+            conn.execute("DELETE FROM positions WHERE agent_id = ?", (agent_id,))
+            trade_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM trades WHERE agent_id = ?",
+                    (agent_id,),
+                ).fetchone()[0]
+            )
+            return {"agent": deleted, "trade_count_retained": trade_count}
 
     def set_agent_belief(self, market_id: int, agent_id: int, new_belief: float) -> float:
         with self._begin_immediate():
@@ -464,7 +488,7 @@ class MarketService:
                     f"market {market_id} uses {mkt['mechanism']!r}."
                 )
             agent = conn.execute(
-                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+                "SELECT * FROM agents WHERE id = ? AND deleted_at IS NULL", (agent_id,)
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -618,7 +642,7 @@ class MarketService:
                     f"market {market_id} uses {mkt['mechanism']!r}."
                 )
             agent = conn.execute(
-                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+                "SELECT * FROM agents WHERE id = ? AND deleted_at IS NULL", (agent_id,)
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -792,7 +816,13 @@ class MarketService:
         resting_lookup: Dict[tuple, deque] = defaultdict(deque)
 
         orders = store.conn.execute(
-            "SELECT * FROM orders WHERE market_id = ? AND status = 'open' ORDER BY id ASC",
+            """
+            SELECT o.*
+            FROM orders o
+            JOIN agents a ON a.id = o.agent_id
+            WHERE o.market_id = ? AND o.status = 'open' AND a.deleted_at IS NULL
+            ORDER BY o.id ASC
+            """,
             (mkt["id"],),
         ).fetchall()
         for o in orders:
@@ -809,3 +839,16 @@ class MarketService:
             })
 
         return cda, resting_lookup
+
+    def create_news_event(self, **kwargs: Any) -> Dict[str, Any]:
+        with self._begin_immediate():
+            return self._get_store().create_news_event(**kwargs)
+
+    def list_news_events(
+        self,
+        market_id: int,
+        *,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        return self._get_store().list_news_events(market_id, limit=limit, offset=offset)

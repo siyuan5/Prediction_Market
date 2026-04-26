@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS agents (
     belief      REAL,
     rho         REAL,
     personality TEXT,
-    created_at  TEXT    NOT NULL
+    created_at  TEXT    NOT NULL,
+    deleted_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS positions (
@@ -98,6 +99,22 @@ CREATE TABLE IF NOT EXISTS orders (
     remaining  REAL    NOT NULL,
     status     TEXT    NOT NULL DEFAULT 'open',
     created_at TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS news_events (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id              INTEGER NOT NULL REFERENCES markets(id),
+    headline               TEXT    NOT NULL,
+    mode                   TEXT    NOT NULL,
+    requested_new_belief   REAL,
+    requested_delta        REAL,
+    affected_fraction      REAL    NOT NULL,
+    min_signal_sensitivity REAL    NOT NULL,
+    n_candidates           INTEGER NOT NULL,
+    n_affected             INTEGER NOT NULL,
+    mean_belief_before     REAL    NOT NULL,
+    mean_belief_after      REAL    NOT NULL,
+    created_at             TEXT    NOT NULL
 );
 """
 
@@ -148,6 +165,8 @@ class MarketStore:
             self.conn.execute("ALTER TABLE agents ADD COLUMN rho REAL")
         if "personality" not in cols:
             self.conn.execute("ALTER TABLE agents ADD COLUMN personality TEXT")
+        if "deleted_at" not in cols:
+            self.conn.execute("ALTER TABLE agents ADD COLUMN deleted_at TEXT")
 
     def close(self) -> None:
         if self._owns_conn:
@@ -384,7 +403,10 @@ class MarketStore:
         return self._agent_row_to_dict(row)
 
     def get_agent(self, agent_id: int) -> Dict[str, Any]:
-        row = self.conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT * FROM agents WHERE id = ? AND deleted_at IS NULL",
+            (agent_id,),
+        ).fetchone()
         if row is None:
             raise ValueError(f"Agent {agent_id} not found")
         return self._agent_row_to_dict(row)
@@ -399,10 +421,12 @@ class MarketStore:
             raise ValueError("limit must be >= 1")
         if offset < 0:
             raise ValueError("offset must be >= 0")
-        total_row = self.conn.execute("SELECT COUNT(*) AS c FROM agents").fetchone()
+        total_row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM agents WHERE deleted_at IS NULL"
+        ).fetchone()
         total = int(total_row["c"] if total_row is not None else 0)
         rows = self.conn.execute(
-            "SELECT * FROM agents ORDER BY id LIMIT ? OFFSET ?",
+            "SELECT * FROM agents WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
         return {
@@ -441,7 +465,7 @@ class MarketStore:
             return self.get_agent(agent_id)
         with self._transaction():
             exists = self.conn.execute(
-                "SELECT id FROM agents WHERE id = ?",
+                "SELECT id FROM agents WHERE id = ? AND deleted_at IS NULL",
                 (agent_id,),
             ).fetchone()
             if exists is None:
@@ -457,7 +481,7 @@ class MarketStore:
         """Update global agent belief and return the previous value."""
         with self._transaction():
             row = self.conn.execute(
-                "SELECT belief FROM agents WHERE id = ?",
+                "SELECT belief FROM agents WHERE id = ? AND deleted_at IS NULL",
                 (agent_id,),
             ).fetchone()
             if row is None:
@@ -469,6 +493,24 @@ class MarketStore:
             )
         return old_belief
 
+    def soft_delete_agent(self, agent_id: int) -> Dict[str, Any]:
+        """Mark an agent deleted without removing historical trades."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            row = self.conn.execute(
+                "SELECT * FROM agents WHERE id = ? AND deleted_at IS NULL",
+                (agent_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Agent {agent_id} not found")
+            self.conn.execute(
+                "UPDATE agents SET deleted_at = ? WHERE id = ?",
+                (now, agent_id),
+            )
+        deleted = dict(row)
+        deleted["deleted_at"] = now
+        return deleted
+
     def update_agent_portfolio(
         self,
         market_id: int,
@@ -479,7 +521,7 @@ class MarketStore:
         """Directly adjust an agent's cash and shares for a market."""
         with self._transaction():
             agent = self.conn.execute(
-                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+                "SELECT * FROM agents WHERE id = ? AND deleted_at IS NULL", (agent_id,)
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -505,7 +547,7 @@ class MarketStore:
         """Lazy-create an agent/market position row if it doesn't exist."""
         with self._transaction():
             agent = self.conn.execute(
-                "SELECT id FROM agents WHERE id = ?",
+                "SELECT id FROM agents WHERE id = ? AND deleted_at IS NULL",
                 (agent_id,),
             ).fetchone()
             if agent is None:
@@ -578,7 +620,7 @@ class MarketStore:
                 )
 
             agent = self.conn.execute(
-                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+                "SELECT * FROM agents WHERE id = ? AND deleted_at IS NULL", (agent_id,)
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -689,7 +731,7 @@ class MarketStore:
                 )
 
             agent = self.conn.execute(
-                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+                "SELECT * FROM agents WHERE id = ? AND deleted_at IS NULL", (agent_id,)
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -853,6 +895,79 @@ class MarketStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def create_news_event(
+        self,
+        *,
+        market_id: int,
+        headline: str,
+        mode: str,
+        requested_new_belief: Optional[float],
+        requested_delta: Optional[float],
+        affected_fraction: float,
+        min_signal_sensitivity: float,
+        n_candidates: int,
+        n_affected: int,
+        mean_belief_before: float,
+        mean_belief_after: float,
+    ) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            mkt = self.conn.execute("SELECT id FROM markets WHERE id = ?", (market_id,)).fetchone()
+            if mkt is None:
+                raise ValueError(f"Market {market_id} not found")
+            cur = self.conn.execute(
+                """
+                INSERT INTO news_events (
+                    market_id, headline, mode, requested_new_belief, requested_delta,
+                    affected_fraction, min_signal_sensitivity, n_candidates, n_affected,
+                    mean_belief_before, mean_belief_after, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    market_id, headline, mode, requested_new_belief, requested_delta,
+                    affected_fraction, min_signal_sensitivity, n_candidates, n_affected,
+                    mean_belief_before, mean_belief_after, now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM news_events WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+        return self._news_row_to_dict(row)
+
+    def list_news_events(
+        self,
+        market_id: int,
+        *,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        mkt = self.conn.execute("SELECT id FROM markets WHERE id = ?", (market_id,)).fetchone()
+        if mkt is None:
+            raise ValueError(f"Market {market_id} not found")
+        total_row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM news_events WHERE market_id = ?",
+            (market_id,),
+        ).fetchone()
+        total = int(total_row["c"] if total_row is not None else 0)
+        rows = self.conn.execute(
+            """
+            SELECT * FROM news_events
+            WHERE market_id = ?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (market_id, limit, offset),
+        ).fetchall()
+        return {
+            "events": [self._news_row_to_dict(r) for r in rows],
+            "total": total,
+        }
+
     # ── Row converters ─────────────────────────────────────────────────
 
     @staticmethod
@@ -888,4 +1003,23 @@ class MarketStore:
             "rho": row["rho"],
             "personality": row["personality"],
             "created_at": row["created_at"],
+            "deleted_at": row["deleted_at"],
+        }
+
+    @staticmethod
+    def _news_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "market_id": row["market_id"],
+            "headline": row["headline"],
+            "mode": row["mode"],
+            "requested_new_belief": row["requested_new_belief"],
+            "requested_delta": row["requested_delta"],
+            "affected_fraction": row["affected_fraction"],
+            "min_signal_sensitivity": row["min_signal_sensitivity"],
+            "n_candidates": row["n_candidates"],
+            "n_affected": row["n_affected"],
+            "mean_belief_before": row["mean_belief_before"],
+            "mean_belief_after": row["mean_belief_after"],
+            "at_timestamp": row["created_at"],
         }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 type AgentProfile = {
   agent_id: number;
@@ -80,6 +80,7 @@ function personalitySummary(personality: Record<string, unknown>) {
 }
 
 export function AgentDetailPage() {
+  const navigate = useNavigate();
   const { agentId: agentParam } = useParams();
   const agentId = Number.parseInt(agentParam ?? "", 10);
 
@@ -92,6 +93,7 @@ export function AgentDetailPage() {
   const [loading, setLoading] = useState(true);
   const [sortKey, setSortKey] = useState<TradeSortKey>("at");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   const load = useCallback(async () => {
     if (!Number.isFinite(agentId)) return;
@@ -159,6 +161,22 @@ export function AgentDetailPage() {
     }
   }
 
+  async function handleDeleteAgent() {
+    if (!agent) return;
+    if (!window.confirm(`Delete agent "${agent.name}"? Trade history stays in the database.`)) return;
+    setDeleteBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/agents/${agentId}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      navigate("/agents", { replace: true });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
   if (!Number.isFinite(agentId)) {
     return (
       <p className="pm-error">
@@ -190,6 +208,16 @@ export function AgentDetailPage() {
             Agent #{agentId} · belief {fmtPct(agent?.belief)} · rho {agent?.rho != null ? agent.rho.toFixed(2) : "--"}
           </p>
           <p className="pm-muted small">{agent ? personalitySummary(agent.personality ?? {}) : "Loading profile..."}</p>
+          {agent ? (
+            <button
+              type="button"
+              className="pm-btn-danger pm-detail-delete"
+              disabled={deleteBusy}
+              onClick={() => void handleDeleteAgent()}
+            >
+              {deleteBusy ? "Deleting..." : "Delete agent"}
+            </button>
+          ) : null}
         </div>
         <div className="pm-detail-yes-block">
           <div className="pm-yes-huge-label">Total PnL</div>

@@ -160,6 +160,35 @@ def test_price_mean_belief_pools_all_agents(client):
     assert body["mean_belief"] == pytest.approx(0.6)
 
 
+def test_delete_agent_hides_from_ui_but_keeps_trade_history(client):
+    aid = _create_agent(client, name="soft-delete-me", belief=0.62)["agent_id"]
+    mid = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "ground_truth": 0.6, "b": 70.0, "title": "agent-delete-history"},
+    ).json()["market_id"]
+    assert client.post(f"/api/market/{mid}/join", json={"agent_id": aid}).status_code == 200
+    tr = client.post(f"/api/market/{mid}/trade", json={"agent_id": aid, "quantity": 1.0})
+    assert tr.status_code == 200, tr.text
+
+    d = client.delete(f"/api/agents/{aid}")
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["deleted"] is True
+    assert body["agent_id"] == aid
+    assert body["trade_count_retained"] >= 1
+
+    listed = client.get("/api/agents?limit=500&offset=0").json()["agents"]
+    assert not any(a["agent_id"] == aid for a in listed)
+    assert client.get(f"/api/agents/{aid}").status_code == 404
+    assert client.post(f"/api/market/{mid}/trade", json={"agent_id": aid, "quantity": 0.5}).status_code == 404
+
+    # Trade rows remain in DB and are still visible in market history.
+    mtr = client.get(f"/api/market/{mid}/trades?limit=500")
+    assert mtr.status_code == 200, mtr.text
+    rows = mtr.json()["trades"]
+    assert any(int(r["agent_id"]) == aid for r in rows)
+
+
 def test_agents_create_list_patch_and_alias(client):
     created = _create_agent(client, name="alice", belief=0.61)
     assert created["name"] == "alice"
@@ -270,6 +299,49 @@ def test_full_market_flow_with_news_injection(client):
         assert check.status_code == 200, check.text
         current = float(check.json()["belief"])
         assert abs(current - float(row["new_belief"])) < 1e-9
+
+
+def test_news_events_persist_and_history_endpoint_returns_them(client):
+    for i in range(4):
+        _create_agent(client, name=f"news-a{i}", belief=0.55 + i * 0.01)
+    mid = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "title": "News history market", "ground_truth": 0.63, "b": 55.0},
+    ).json()["market_id"]
+
+    n1 = client.post(
+        f"/api/market/{mid}/news",
+        json={
+            "headline": "Event one",
+            "delta": 0.10,
+            "affected_fraction": 0.5,
+            "min_signal_sensitivity": 0.0,
+        },
+    )
+    n2 = client.post(
+        f"/api/market/{mid}/news",
+        json={
+            "headline": "Event two",
+            "new_belief": 0.72,
+            "affected_fraction": 0.5,
+            "min_signal_sensitivity": 0.0,
+        },
+    )
+    assert n1.status_code == 200, n1.text
+    assert n2.status_code == 200, n2.text
+    assert n1.json()["news_event_id"] != n2.json()["news_event_id"]
+
+    hist = client.get(f"/api/market/{mid}/news?limit=10&offset=0")
+    assert hist.status_code == 200, hist.text
+    body = hist.json()
+    assert body["total"] >= 2
+    events = body["events"]
+    headlines = [e["headline"] for e in events]
+    assert "Event one" in headlines
+    assert "Event two" in headlines
+    for ev in events:
+        assert "at_timestamp" in ev
+        assert ev["mode"] in ("absolute", "delta")
 
 
 def test_two_market_start_stop_lifecycle_no_zombies(client, monkeypatch):

@@ -418,6 +418,24 @@ def patch_agent(agent_id: int, body: AgentPatchRequest) -> Dict[str, Any]:
     return _agent_response_row(updated)
 
 
+@agents_router.delete("/agents/{agent_id}")
+def delete_agent(agent_id: int) -> Dict[str, Any]:
+    """
+    Soft-delete an agent: hide from UI/API listings while keeping historical
+    trade rows for audit/history.
+    """
+    svc = get_market_service()
+    try:
+        result = svc.delete_agent(agent_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    return {
+        "deleted": True,
+        "agent_id": int(agent_id),
+        "trade_count_retained": int(result.get("trade_count_retained") or 0),
+    }
+
+
 @router.post("/create", status_code=201)
 def create_market(body: MarketCreateRequest) -> Dict[str, Any]:
     """
@@ -951,7 +969,7 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
         mean_before = 0.0
         mean_after = 0.0
 
-    return {
+    result = {
         "market_id": market_id,
         "headline": body.headline,
         "mode": "absolute" if body.new_belief is not None else "delta",
@@ -966,6 +984,39 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
         "affected_agents": changed,
         "at_timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    try:
+        persisted = svc.create_news_event(
+            market_id=int(market_id),
+            headline=str(result["headline"]),
+            mode=str(result["mode"]),
+            requested_new_belief=result["requested_new_belief"],
+            requested_delta=result["requested_delta"],
+            affected_fraction=float(result["affected_fraction"]),
+            min_signal_sensitivity=float(result["min_signal_sensitivity"]),
+            n_candidates=int(result["n_candidates"]),
+            n_affected=int(result["n_affected"]),
+            mean_belief_before=float(result["mean_belief_before"]),
+            mean_belief_after=float(result["mean_belief_after"]),
+        )
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    result["news_event_id"] = int(persisted["id"])
+    result["at_timestamp"] = str(persisted["at_timestamp"])
+    return result
+
+
+@router.get("/{market_id}/news")
+def list_news_events(
+    market_id: int,
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> Dict[str, Any]:
+    svc = get_market_service()
+    try:
+        data = svc.list_news_events(market_id, limit=limit, offset=offset)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    return {"events": data["events"], "total": int(data["total"])}
 
 
 @router.post("/{market_id}/start")

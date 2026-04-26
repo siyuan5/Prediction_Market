@@ -19,6 +19,7 @@ export function AgentsPage() {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [edits, setEdits] = useState<Record<number, string>>({});
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [deleteBusyId, setDeleteBusyId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -87,6 +88,21 @@ export function AgentsPage() {
     }
   }
 
+  async function deleteAgent(agentId: number, name: string) {
+    if (!window.confirm(`Delete agent "${name}"? Trade history stays in the database.`)) return;
+    setDeleteBusyId(agentId);
+    setError(null);
+    try {
+      const res = await fetch(`/api/agents/${agentId}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteBusyId(null);
+    }
+  }
+
   return (
     <div className="pm-page">
       <nav className="pm-breadcrumb">
@@ -133,6 +149,7 @@ export function AgentsPage() {
                 </button>
               </th>
               <th>Set belief</th>
+              <th>Delete</th>
             </tr>
           </thead>
           <tbody>
@@ -168,6 +185,16 @@ export function AgentsPage() {
                       Apply
                     </button>
                   </div>
+                </td>
+                <td onClick={(e) => e.stopPropagation()}>
+                  <button
+                    type="button"
+                    className="pm-btn-danger"
+                    disabled={deleteBusyId === a.agent_id}
+                    onClick={() => void deleteAgent(a.agent_id, a.name)}
+                  >
+                    {deleteBusyId === a.agent_id ? "Deleting..." : "Delete"}
+                  </button>
                 </td>
               </tr>
             ))}
