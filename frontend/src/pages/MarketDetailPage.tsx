@@ -519,6 +519,9 @@ export function MarketDetailPage() {
     price?.last_trade_price != null && Number.isFinite(Number(price.last_trade_price))
       ? Math.round(Number(price.last_trade_price) * 1000) / 10
       : null;
+  const isCda = detail?.mechanism === "cda";
+  const livePriceLabel = isCda ? "Reference Yes (book mid)" : "Implied Yes (LMSR mid)";
+  const chartPriceName = isCda ? "Book mid / reference" : "LMSR mid";
 
   return (
     <div className="pm-page pm-detail">
@@ -554,7 +557,7 @@ export function MarketDetailPage() {
           ) : null}
         </div>
         <div className="pm-detail-yes-block" aria-live="polite">
-          <div className="pm-yes-huge-label">Implied Yes (LMSR mid)</div>
+          <div className="pm-yes-huge-label">{livePriceLabel}</div>
           <div className="pm-yes-huge">{midPct != null ? `${midPct}%` : "—"}</div>
           {lastPrintPct != null ? (
             <div className="pm-ts">Last trade print: {lastPrintPct}%</div>
@@ -692,10 +695,9 @@ export function MarketDetailPage() {
         <section className="pm-panel pm-grow">
           <h2>Live price</h2>
           <p className="pm-muted small" style={{ marginTop: "-0.25rem", marginBottom: "0.5rem" }}>
-            <strong>Green</strong> = LMSR mid (inventory). <strong>Purple</strong> = mean belief over agents in this
-            market.{" "}
-            <strong>Amber dashed</strong> = scenario P* (ground truth). Same idea as Classic &quot;Mean belief vs
-            price&quot;—mid can still pin near 0%/100% while beliefs sit near P*. Trade feed shows execution prices.
+            <strong>Green</strong> = {isCda ? "CDA reference/book mid" : "LMSR mid (inventory)"}.
+            <strong> Purple</strong> = mean belief over agents in this market. <strong>Amber dashed</strong> = scenario
+            P* (ground truth). Trade feed shows execution prices.
           </p>
           <div className="pm-chart-wrap">
             {chartData.length === 0 ? (
@@ -724,7 +726,7 @@ export function MarketDetailPage() {
                   <Line
                     type="monotone"
                     dataKey="mid"
-                    name="LMSR mid"
+                    name={chartPriceName}
                     stroke="#22c55e"
                     strokeWidth={2}
                     dot={false}

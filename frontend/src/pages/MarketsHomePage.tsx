@@ -54,7 +54,7 @@ export function MarketsHomePage() {
     if (
       !window.confirm(
         `Delete market "${label}"? This removes the market, its trades, and positions. ` +
-          `Traders who only existed for this market are removed from the pool; others are kept.`,
+          `Agents are kept in the global pool.`,
       )
     ) {
       return;
