@@ -191,6 +191,16 @@ class NewsEventRequest(BaseModel):
         return self
 
 
+class ResolveMarketRequest(BaseModel):
+    outcome: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "ResolveMarketRequest":
+        if self.outcome is not None and self.outcome not in ("yes", "no"):
+            raise ValueError("outcome must be 'yes' or 'no'")
+        return self
+
+
 def _http_from_value(err: ValueError, *, not_found: bool = False) -> None:
     msg = str(err)
     low = msg.lower()
@@ -526,6 +536,8 @@ def get_market_detail(market_id: int) -> Dict[str, Any]:
         "title": str(m.get("title") or ""),
         "slug": m.get("slug"),
         "status": str(m.get("status") or ""),
+        "resolution": m.get("resolution"),
+        "resolved_at": m.get("resolved_at"),
         "mechanism": str(m.get("mechanism") or ""),
         "ground_truth": float(m.get("ground_truth") or 0.5),
         "b": float(m.get("b") or 0.0),
@@ -533,6 +545,41 @@ def get_market_detail(market_id: int) -> Dict[str, Any]:
         "trade_count": tc,
         "active_agents": aa,
     }
+
+
+@router.post("/{market_id}/resolve")
+def resolve_market(market_id: int, body: Optional[ResolveMarketRequest] = None) -> Dict[str, Any]:
+    """Resolve one market and return settlement summary (winners/losers/payout)."""
+    svc = get_market_service()
+    try:
+        mkt = svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+
+    runner = get_agent_runner()
+    if runner.is_running(market_id):
+        try:
+            runner.stop_market(market_id)
+        except ValueError:
+            pass
+
+    requested_outcome = body.outcome if body is not None else None
+    resolution_draw_u: Optional[float] = None
+    if requested_outcome is None:
+        ground_truth = float(mkt.get("ground_truth") or 0.5)
+        resolution_draw_u = float(random.random())
+        requested_outcome = "yes" if resolution_draw_u < ground_truth else "no"
+
+    try:
+        settlement = svc.resolve_market(market_id, requested_outcome)
+    except ValueError as e:
+        _http_from_value(e)
+    if resolution_draw_u is not None:
+        settlement["resolution_draw_u"] = resolution_draw_u
+        settlement["resolution_mode"] = "ground_truth_draw"
+    else:
+        settlement["resolution_mode"] = "manual_override"
+    return settlement
 
 
 @router.get("/{market_id}/comments")

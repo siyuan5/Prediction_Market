@@ -237,6 +237,47 @@ def test_market_join_and_lmsr_trade(client):
     assert out["executed_quantity"] != 0
 
 
+def test_resolve_market_returns_settlement_and_blocks_trading(client, monkeypatch):
+    aid = _create_agent(client, name="settle-trader", belief=0.64)["agent_id"]
+    mid = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "ground_truth": 0.7, "b": 90.0, "title": "resolve-api"},
+    ).json()["market_id"]
+
+    assert client.post(f"/api/market/{mid}/join", json={"agent_id": aid}).status_code == 200
+    trade = client.post(f"/api/market/{mid}/trade", json={"agent_id": aid, "quantity": 4.0})
+    assert trade.status_code == 200, trade.text
+    cash_after_trade = float(trade.json()["agent_cash_after"])
+
+    monkeypatch.setattr("api.market_routes.random.random", lambda: 0.05)
+    resolved = client.post(f"/api/market/{mid}/resolve")
+    assert resolved.status_code == 200, resolved.text
+    body = resolved.json()
+    assert body["market_id"] == mid
+    assert body["outcome"] == "yes"
+    assert body["resolution_mode"] == "ground_truth_draw"
+    assert body["resolution_draw_u"] == pytest.approx(0.05)
+    assert body["positions_settled"] == 1
+    assert "winners" in body and "losers" in body
+    assert isinstance(body["winners"], list)
+    assert isinstance(body["losers"], list)
+    assert body["total_payout"] > 0
+
+    detail = client.get(f"/api/market/{mid}/detail")
+    assert detail.status_code == 200, detail.text
+    d = detail.json()
+    assert d["status"] == "resolved"
+    assert d["resolution"] == "yes"
+    assert d["resolved_at"] is not None
+
+    profile = client.get(f"/api/market/{mid}/agent/{aid}")
+    assert profile.status_code == 200, profile.text
+    assert float(profile.json()["cash"]) > cash_after_trade
+
+    blocked = client.post(f"/api/market/{mid}/trade", json={"agent_id": aid, "quantity": 1.0})
+    assert blocked.status_code in (400, 409)
+
+
 def test_full_market_flow_with_news_injection(client):
     before = client.get("/api/markets")
     assert before.status_code == 200, before.text

@@ -8,6 +8,8 @@ type Detail = {
   mechanism: string;
   /** open | running | stopped | … */
   status: string;
+  resolution?: "yes" | "no" | null;
+  resolved_at?: string | null;
   ground_truth: number;
   price: number;
   trade_count: number;
@@ -57,6 +59,25 @@ type NewsEventRow = {
   at_timestamp: string;
 };
 
+type SettlementRow = {
+  agent_id: number;
+  name: string;
+  yes_shares: number;
+  payout: number;
+  cash_after: number;
+};
+
+type SettlementResult = {
+  market_id: number;
+  outcome: "yes" | "no";
+  payoff_per_yes_share: number;
+  positions_settled: number;
+  total_payout: number;
+  winners: SettlementRow[];
+  losers: SettlementRow[];
+  resolved_at: string;
+};
+
 export function MarketDetailPage() {
   const navigate = useNavigate();
   const { marketId: midParam } = useParams();
@@ -88,6 +109,9 @@ export function MarketDetailPage() {
   const [serverTradeTotal, setServerTradeTotal] = useState<number | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [newsHistory, setNewsHistory] = useState<NewsEventRow[]>([]);
+  const [showResolve, setShowResolve] = useState(false);
+  const [resolveBusy, setResolveBusy] = useState(false);
+  const [settlement, setSettlement] = useState<SettlementResult | null>(null);
 
   const loadDetail = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
@@ -434,6 +458,28 @@ export function MarketDetailPage() {
     }
   }
 
+  async function resolveMarket() {
+    setResolveBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/market/${marketId}/resolve`, {
+        method: "POST",
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const payload = (await res.json()) as SettlementResult;
+      setSettlement(payload);
+      setRunning(false);
+      setShowResolve(false);
+      tickRef.current += 1;
+      await loadDetail();
+      await fetchPrice();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setResolveBusy(false);
+    }
+  }
+
   const chartData = useMemo(() => {
     if (chartRows.length === 0) return [];
     const t0 = chartRows[0].t;
@@ -527,58 +573,120 @@ export function MarketDetailPage() {
         </div>
       ) : null}
 
-      <section className="pm-panel pm-controls-panel">
-        <h2 className="pm-controls-title">Trading controls</h2>
-        <p className="pm-muted small" style={{ marginTop: 0 }}>
-          <strong>1.</strong> Spawn adds traders to the global pool. <strong>2.</strong>{" "}
-          <strong>Start trading</strong> turns on autonomous activity (nothing happens until then). With many agents,
-          different IDs will show in the feed over time—not only one.
-        </p>
-        <div className="pm-controls-grid">
-          <div className="pm-control-block">
-            <span className="pm-control-label">Step 1 — Agents</span>
-            <div className="pm-inline">
-              <label>
-                Count
-                <input
-                  type="number"
-                  min={1}
-                  max={200}
-                  value={demoN}
-                  onChange={(e) => setDemoN(Number(e.target.value))}
-                  disabled={busy}
-                />
-              </label>
-              <button type="button" className="pm-btn-secondary" disabled={busy} onClick={spawnDemoAgents}>
-                Spawn agents
-              </button>
+      {detail?.status === "resolved" ? (
+        <section className="pm-panel pm-controls-panel">
+          <h2 className="pm-controls-title">Market resolved</h2>
+          <p className="pm-muted small" style={{ marginTop: 0 }}>
+            Outcome: <strong>{(settlement?.outcome ?? detail.resolution ?? "unknown").toUpperCase()}</strong>
+            {detail.resolved_at ? ` · ${new Date(detail.resolved_at).toLocaleString()}` : ""}
+          </p>
+          <p className="pm-muted small">
+            Positions settled: <strong>{settlement?.positions_settled ?? "n/a"}</strong> · Total payout:{" "}
+            <strong>
+              {typeof settlement?.total_payout === "number" ? settlement.total_payout.toFixed(2) : "n/a"}
+            </strong>
+          </p>
+          {settlement ? (
+            <div className="pm-two-col">
+              <section className="pm-panel">
+                <h3>Top payouts</h3>
+                <div className="pm-feed">
+                  {settlement.winners.length === 0 ? (
+                    <span className="pm-muted">No settled traders.</span>
+                  ) : (
+                    settlement.winners.slice(0, 5).map((row) => (
+                      <div key={`w-${row.agent_id}`} className="pm-feed-row">
+                        Agent {row.agent_id} ({row.name}) · {row.yes_shares.toFixed(2)} shares · payout{" "}
+                        {row.payout.toFixed(2)}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </section>
+              <section className="pm-panel">
+                <h3>Lowest payouts</h3>
+                <div className="pm-feed">
+                  {settlement.losers.length === 0 ? (
+                    <span className="pm-muted">No settled traders.</span>
+                  ) : (
+                    settlement.losers.slice(0, 5).map((row) => (
+                      <div key={`l-${row.agent_id}`} className="pm-feed-row">
+                        Agent {row.agent_id} ({row.name}) · {row.yes_shares.toFixed(2)} shares · payout{" "}
+                        {row.payout.toFixed(2)}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </section>
+            </div>
+          ) : (
+            <p className="pm-muted small" style={{ marginBottom: 0 }}>
+              This market is already resolved. Detailed winner/loser payout rows appear immediately after resolution.
+            </p>
+          )}
+        </section>
+      ) : (
+        <section className="pm-panel pm-controls-panel">
+          <h2 className="pm-controls-title">Trading controls</h2>
+          <p className="pm-muted small" style={{ marginTop: 0 }}>
+            <strong>1.</strong> Spawn adds traders to the global pool. <strong>2.</strong>{" "}
+            <strong>Start trading</strong> turns on autonomous activity (nothing happens until then). With many agents,
+            different IDs will show in the feed over time—not only one.
+          </p>
+          <div className="pm-controls-grid">
+            <div className="pm-control-block">
+              <span className="pm-control-label">Step 1 — Agents</span>
+              <div className="pm-inline">
+                <label>
+                  Count
+                  <input
+                    type="number"
+                    min={1}
+                    max={200}
+                    value={demoN}
+                    onChange={(e) => setDemoN(Number(e.target.value))}
+                    disabled={busy || resolveBusy}
+                  />
+                </label>
+                <button type="button" className="pm-btn-secondary" disabled={busy || resolveBusy} onClick={spawnDemoAgents}>
+                  Spawn agents
+                </button>
+              </div>
+            </div>
+            <div className="pm-control-block pm-control-primary">
+              <span className="pm-control-label">Step 2 — Autonomous engine</span>
+              <div className="pm-toolbar">
+                <button type="button" className="pm-btn-primary" disabled={busy || resolveBusy || running} onClick={handleStart}>
+                  Start trading
+                </button>
+                <button type="button" className="pm-btn-danger" disabled={busy || resolveBusy || !running} onClick={handleStop}>
+                  Stop
+                </button>
+                <button type="button" className="pm-btn-secondary" disabled={busy || resolveBusy} onClick={() => setShowNews(true)}>
+                  News event
+                </button>
+                <button
+                  type="button"
+                  className="pm-btn-success"
+                  disabled={busy || resolveBusy}
+                  onClick={() => setShowResolve(true)}
+                >
+                  Resolve market
+                </button>
+              </div>
+              {running ? (
+                <p className="pm-running-pill" aria-live="polite">
+                  Running — autonomous traders are active for this market
+                </p>
+              ) : (
+                <p className="pm-muted small" style={{ margin: "0.35rem 0 0" }}>
+                  Not running yet — press <strong>Start trading</strong> after spawning agents.
+                </p>
+              )}
             </div>
           </div>
-          <div className="pm-control-block pm-control-primary">
-            <span className="pm-control-label">Step 2 — Autonomous engine</span>
-            <div className="pm-toolbar">
-              <button type="button" className="pm-btn-primary" disabled={busy || running} onClick={handleStart}>
-                Start trading
-              </button>
-              <button type="button" className="pm-btn-danger" disabled={busy || !running} onClick={handleStop}>
-                Stop
-              </button>
-              <button type="button" className="pm-btn-secondary" disabled={busy} onClick={() => setShowNews(true)}>
-                News event
-              </button>
-            </div>
-            {running ? (
-              <p className="pm-running-pill" aria-live="polite">
-                Running — autonomous traders are active for this market
-              </p>
-            ) : (
-              <p className="pm-muted small" style={{ margin: "0.35rem 0 0" }}>
-                Not running yet — press <strong>Start trading</strong> after spawning agents.
-              </p>
-            )}
-          </div>
-        </div>
-      </section>
+        </section>
+      )}
 
       <div className="pm-two-col">
         <section className="pm-panel pm-grow">
@@ -798,6 +906,32 @@ export function MarketDetailPage() {
                 </button>
                 <button type="button" className="pm-btn-primary" disabled={busy} onClick={postNews}>
                   Publish news
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showResolve ? (
+        <div className="pm-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="resolve-title">
+          <div className="pm-modal">
+            <h2 id="resolve-title">Resolve market</h2>
+            <p className="pm-muted">
+              Outcome is drawn automatically from the market&apos;s ground truth probability (P*). This closes the
+              market and settles payouts.
+            </p>
+            <div className="pm-form">
+              <div className="pm-modal-actions">
+                <button
+                  type="button"
+                  className="pm-btn-ghost"
+                  onClick={() => setShowResolve(false)}
+                  disabled={resolveBusy}
+                >
+                  Cancel
+                </button>
+                <button type="button" className="pm-btn-success" disabled={resolveBusy} onClick={resolveMarket}>
+                  {resolveBusy ? "Resolving..." : "Confirm resolution"}
                 </button>
               </div>
             </div>

@@ -435,19 +435,50 @@ class MarketStore:
                 (outcome, now, market_id),
             )
             positions = self.conn.execute(
-                "SELECT agent_id, yes_shares FROM positions WHERE market_id = ?",
+                """
+                SELECT p.agent_id, p.yes_shares, a.name, a.cash
+                FROM positions p
+                JOIN agents a ON a.id = p.agent_id
+                WHERE p.market_id = ?
+                """,
                 (market_id,),
             ).fetchall()
+            settled_rows: List[Dict[str, Any]] = []
+            total_payout = 0.0
             for pos in positions:
-                payout = pos["yes_shares"] * payoff
+                yes_shares = float(pos["yes_shares"])
+                payout = yes_shares * payoff
                 self.conn.execute(
                     "UPDATE agents SET cash = cash + ? WHERE id = ?",
                     (payout, pos["agent_id"]),
                 )
+                total_payout += float(payout)
+                settled_rows.append(
+                    {
+                        "agent_id": int(pos["agent_id"]),
+                        "name": str(pos["name"]),
+                        "yes_shares": yes_shares,
+                        "payout": float(payout),
+                        "cash_after": float(pos["cash"]) + float(payout),
+                    }
+                )
+        winners = sorted(
+            settled_rows,
+            key=lambda row: (-float(row["payout"]), int(row["agent_id"])),
+        )[:10]
+        losers = sorted(
+            settled_rows,
+            key=lambda row: (float(row["payout"]), int(row["agent_id"])),
+        )[:10]
         return {
             "market_id": market_id,
             "outcome": outcome,
+            "payoff_per_yes_share": payoff,
             "positions_settled": len(positions),
+            "total_payout": float(total_payout),
+            "winners": winners,
+            "losers": losers,
+            "resolved_at": now,
         }
 
     # ── Agents ─────────────────────────────────────────────────────────
