@@ -19,6 +19,7 @@ export function AgentsPage() {
   const [sortKey, setSortKey] = useState<SortKey>("agent_id");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [deleteBusyId, setDeleteBusyId] = useState<number | null>(null);
+  const [deleteAllBusy, setDeleteAllBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -62,6 +63,7 @@ export function AgentsPage() {
   }
 
   async function deleteAgent(agentId: number, name: string) {
+    if (deleteAllBusy) return;
     if (!window.confirm(`Delete agent "${name}"? Trade history stays in the database.`)) return;
     setDeleteBusyId(agentId);
     setError(null);
@@ -73,6 +75,32 @@ export function AgentsPage() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setDeleteBusyId(null);
+    }
+  }
+
+  async function deleteAllAgents() {
+    if (agents.length === 0 || deleteAllBusy) return;
+    if (
+      !window.confirm(
+        `Delete all ${agents.length} agents currently listed? ` +
+          "Trade history stays in the database.",
+      )
+    ) {
+      return;
+    }
+    setDeleteAllBusy(true);
+    setError(null);
+    try {
+      const ids = agents.map((a) => a.agent_id);
+      for (const agentId of ids) {
+        const res = await fetch(`/api/agents/${agentId}`, { method: "DELETE" });
+        if (!res.ok) throw new Error(await res.text());
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteAllBusy(false);
     }
   }
 
@@ -91,6 +119,17 @@ export function AgentsPage() {
           {error}
         </p>
       ) : null}
+
+      <div className="pm-toolbar" style={{ justifyContent: "flex-end" }}>
+        <button
+          type="button"
+          className="pm-btn-danger"
+          disabled={deleteAllBusy || deleteBusyId != null || agents.length === 0}
+          onClick={() => void deleteAllAgents()}
+        >
+          {deleteAllBusy ? "Deleting all..." : `Delete all agents (${agents.length})`}
+        </button>
+      </div>
 
       <div className="pm-panel pm-table-wrap">
         <table className="pm-table">
@@ -144,7 +183,7 @@ export function AgentsPage() {
                   <button
                     type="button"
                     className="pm-btn-danger"
-                    disabled={deleteBusyId === a.agent_id}
+                    disabled={deleteAllBusy || deleteBusyId === a.agent_id}
                     onClick={() => void deleteAgent(a.agent_id, a.name)}
                   >
                     {deleteBusyId === a.agent_id ? "Deleting..." : "Delete"}
