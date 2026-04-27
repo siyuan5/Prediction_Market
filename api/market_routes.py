@@ -272,11 +272,16 @@ def create_agent(body: AgentCreateRequest) -> Dict[str, Any]:
     else:
         personality_dict = sample_personality(DEFAULT_POPULATION_DIST).to_dict()
     personality_json = json.dumps(personality_dict)
+    # Keep default belief market-independent but non-degenerate so autonomous
+    # agents can still discover edges and start trading without manual seeding.
+    initial_belief = body.belief
+    if initial_belief is None:
+        initial_belief = float(np.clip(0.5 + random.uniform(-0.2, 0.2), 0.01, 0.99))
     try:
         agent = svc.create_agent(
             body.name,
             body.cash,
-            belief=body.belief,
+            belief=initial_belief,
             rho=body.rho,
             personality=personality_json,
         )

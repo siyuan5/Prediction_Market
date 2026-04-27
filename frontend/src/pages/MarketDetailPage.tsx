@@ -361,7 +361,7 @@ export function MarketDetailPage() {
     if (
       !window.confirm(
         `Delete "${label}"? This removes the market and its history. ` +
-          `Traders who only participated here are removed from the pool; others are kept.`,
+          `Agents are kept in the global pool.`,
       )
     ) {
       return;

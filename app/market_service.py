@@ -345,11 +345,11 @@ class MarketService:
         """
         Remove a market and all trades, orders, and positions for it.
 
-        Deletes **orphan** agent rows: agents who only ever participated in this
-        market (no remaining positions, trades, or open orders anywhere).
+        Agent rows are intentionally preserved even if they only participated in
+        the deleted market.
 
         Returns:
-            Number of agent rows removed.
+            Number of agent rows removed (always 0).
         """
         with self._begin_immediate():
             store = self._get_store()
@@ -358,49 +358,12 @@ class MarketService:
             if row is None:
                 raise ValueError(f"Market {market_id} not found")
 
-            involved = conn.execute(
-                """
-                SELECT DISTINCT agent_id FROM (
-                    SELECT agent_id FROM trades WHERE market_id = ?
-                    UNION SELECT agent_id FROM positions WHERE market_id = ?
-                    UNION SELECT agent_id FROM orders WHERE market_id = ?
-                )
-                """,
-                (market_id, market_id, market_id),
-            ).fetchall()
-            agent_ids = [int(r[0]) for r in involved]
-
             conn.execute("DELETE FROM trades WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM orders WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM positions WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM news_events WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM markets WHERE id = ?", (market_id,))
-
-            removed = 0
-            for aid in agent_ids:
-                n_pos = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM positions WHERE agent_id = ?",
-                        (aid,),
-                    ).fetchone()[0]
-                )
-                n_tr = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM trades WHERE agent_id = ?",
-                        (aid,),
-                    ).fetchone()[0]
-                )
-                n_ord = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM orders WHERE agent_id = ? AND status = 'open'",
-                        (aid,),
-                    ).fetchone()[0]
-                )
-                if n_pos == 0 and n_tr == 0 and n_ord == 0:
-                    now = datetime.now(timezone.utc).isoformat()
-                    conn.execute("UPDATE agents SET deleted_at = ? WHERE id = ?", (now, aid))
-                    removed += 1
-            return removed
+            return 0
 
     def delete_agent(self, agent_id: int) -> Dict[str, Any]:
         """

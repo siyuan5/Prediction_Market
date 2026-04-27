@@ -103,7 +103,7 @@ def test_delete_market_removes_row_and_children(client):
     body = d.json()
     assert body["deleted"] is True
     assert body["market_id"] == mid
-    assert body.get("agents_removed") == 1
+    assert body.get("agents_removed") == 0
 
     assert client.get(f"/api/market/{mid}/detail").status_code == 404
     listed = client.get("/api/markets?status=all&limit=200&offset=0")
@@ -112,7 +112,7 @@ def test_delete_market_removes_row_and_children(client):
     assert mid not in ids
     pool = client.get("/api/agents?limit=500&offset=0")
     assert pool.status_code == 200
-    assert not any(a["agent_id"] == aid for a in pool.json().get("agents", []))
+    assert any(a["agent_id"] == aid for a in pool.json().get("agents", []))
 
 
 def test_delete_market_keeps_agent_with_second_market(client):
@@ -214,6 +214,17 @@ def test_agents_create_list_patch_and_alias(client):
     p = patched.json()
     assert p["belief"] == pytest.approx(0.72)
     assert p["cash"] == pytest.approx(180.0)
+
+
+def test_create_agent_without_belief_gets_market_independent_default(client):
+    res = client.post(
+        "/api/agents",
+        json={"name": "no-belief-default", "cash": 100.0},
+    )
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["belief"] is not None
+    assert 0.01 <= float(body["belief"]) <= 0.99
 
 
 def test_market_join_and_lmsr_trade(client):

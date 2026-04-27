@@ -90,10 +90,6 @@ class AgentRunner:
             for row in rows:
                 seed = self._seed_from_row(row)
                 aid = seed.agent_id
-                # Ensure market-specific state exists before autonomous loops start.
-                # This initializes per-market belief (with deterministic noise) so
-                # agents are not all anchored to a neutral 0.5 fallback.
-                self._market_service.ensure_position(aid, market_id)
                 started_agent_ids.add(aid)
                 state = self._agent_states.get(aid)
                 if state is None:
@@ -212,14 +208,10 @@ class AgentRunner:
             self._ensure_monitor_locked()
             state = self._agent_states.get(aid)
             if state is None:
-                for mid in running_markets:
-                    self._market_service.ensure_position(aid, mid)
                 self._start_agent_locked(seed, running_markets)
             else:
                 state.markets.update(running_markets)
                 state.stop_requested = False
-                for mid in running_markets:
-                    self._market_service.ensure_position(aid, mid)
             for mid in running_markets:
                 self._market_agents[mid].add(aid)
 
@@ -235,9 +227,19 @@ class AgentRunner:
                     personality = parsed
             except json.JSONDecodeError:
                 personality = None
+        raw_belief = row.get("belief")
+        if raw_belief is None:
+            # Keep initialization market-independent while avoiding a degenerate
+            # 0.5 prior for legacy agents that were created without belief.
+            aid_for_seed = int(row.get("agent_id", row.get("id")))
+            belief_rng = aid_for_seed * 1_000_003 + 17_389
+            frac = (belief_rng % 10_000) / 10_000.0
+            belief = max(0.01, min(0.99, 0.35 + 0.30 * frac))
+        else:
+            belief = float(raw_belief)
         return _AgentSeed(
             agent_id=int(row.get("agent_id", row.get("id"))),
-            belief=float(row.get("belief") or 0.5),
+            belief=belief,
             rho=float(row.get("rho") or 1.0),
             cash=float(row.get("cash") or 0.0),
             personality=personality,
