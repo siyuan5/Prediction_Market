@@ -43,7 +43,7 @@ class FakeAutonomousAgent:
 
 @pytest.fixture
 def svc():
-    base = os.path.join(ROOT, "tmp_runner_tests", str(uuid.uuid4()))
+    base = os.path.join(ROOT, "tests", "tmp_runner_tests", str(uuid.uuid4()))
     os.makedirs(base, exist_ok=True)
     s = MarketService(os.path.join(base, "runner.db"))
     yield s

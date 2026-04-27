@@ -23,7 +23,7 @@ if ROOT not in sys.path:
 
 @pytest.fixture
 def client(monkeypatch):
-    tmp_base = os.path.join(ROOT, "tmp_market_api_tests", str(uuid.uuid4()))
+    tmp_base = os.path.join(ROOT, "tests", "tmp_market_api_tests", str(uuid.uuid4()))
     os.makedirs(tmp_base, exist_ok=True)
     monkeypatch.setenv("MARKET_DB_PATH", os.path.join(tmp_base, "m.sqlite"))
     from api.market_routes import reset_market_runtime
