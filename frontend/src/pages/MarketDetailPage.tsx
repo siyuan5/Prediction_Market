@@ -86,11 +86,9 @@ export function MarketDetailPage() {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [price, setPrice] = useState<PriceSnap | null>(null);
   const [trades, setTrades] = useState<TradeRow[]>([]);
+  const [chartTrades, setChartTrades] = useState<TradeRow[]>([]);
   const [book, setBook] = useState<{ bids: { price: number; quantity: number }[]; asks: { price: number; quantity: number }[] } | null>(null);
   const [comments, setComments] = useState<CommentRow[]>([]);
-  const [chartRows, setChartRows] = useState<
-    { t: number; mid: number; meanBelief: number | null; groundTruth: number | null }[]
-  >([]);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -112,6 +110,21 @@ export function MarketDetailPage() {
   const [showResolve, setShowResolve] = useState(false);
   const [resolveBusy, setResolveBusy] = useState(false);
   const [settlement, setSettlement] = useState<SettlementResult | null>(null);
+
+  const mergeTradesUnique = useCallback((prev: TradeRow[], batch: TradeRow[], keepLast?: number): TradeRow[] => {
+    const byId = new Map<string, TradeRow>();
+    for (const row of prev) byId.set(String(row.trade_id), row);
+    for (const row of batch) byId.set(String(row.trade_id), row);
+    const merged = Array.from(byId.values()).sort((a, b) => {
+      const ai = Number.parseInt(String(a.trade_id), 10) || 0;
+      const bi = Number.parseInt(String(b.trade_id), 10) || 0;
+      return ai - bi;
+    });
+    if (keepLast != null && keepLast > 0 && merged.length > keepLast) {
+      return merged.slice(-keepLast);
+    }
+    return merged;
+  }, []);
 
   const loadDetail = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
@@ -144,22 +157,13 @@ export function MarketDetailPage() {
     if (!res.ok) throw new Error(await res.text());
     const p = (await res.json()) as PriceSnap;
     setPrice(p);
-    const t = Date.now();
-    const mid = Number(p.price);
-    const mb =
-      p.mean_belief != null && Number.isFinite(Number(p.mean_belief)) ? Number(p.mean_belief) : null;
-    const gt =
-      p.ground_truth != null && Number.isFinite(Number(p.ground_truth)) ? Number(p.ground_truth) : null;
-    setChartRows((rows) => {
-      const next = [...rows, { t, mid, meanBelief: mb, groundTruth: gt }];
-      return next.slice(-240);
-    });
   }, [marketId]);
 
   const fetchTrades = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
     const since = lastTradeIdRef.current;
-    const q = since > 0 ? `?since=${since}&limit=80` : "?limit=80";
+    const initialLimit = Math.max(500, Number(detail?.trade_count ?? 500));
+    const q = since > 0 ? `?since=${since}&limit=80` : `?limit=${initialLimit}`;
     const res = await fetch(`/api/market/${marketId}/trades${q}`);
     if (!res.ok) throw new Error(await res.text());
     const data = (await res.json()) as { trades: TradeRow[]; total?: number };
@@ -168,10 +172,11 @@ export function MarketDetailPage() {
     }
     const batch = data.trades ?? [];
     if (batch.length === 0) return;
-    setTrades((prev) => [...prev, ...batch].slice(-200));
+    setChartTrades((prev) => mergeTradesUnique(prev, batch));
+    setTrades((prev) => mergeTradesUnique(prev, batch, 200));
     const maxId = Math.max(since, ...batch.map((t) => Number.parseInt(t.trade_id, 10) || 0));
     lastTradeIdRef.current = maxId;
-  }, [marketId]);
+  }, [marketId, detail?.trade_count, mergeTradesUnique]);
 
   const fetchBook = useCallback(async () => {
     if (!Number.isFinite(marketId) || detail?.mechanism !== "cda") return;
@@ -218,7 +223,7 @@ export function MarketDetailPage() {
   }, [loadDetail, refreshGlobalAgentCount]);
 
   useEffect(() => {
-    setChartRows([]);
+    setChartTrades([]);
     lastTradeIdRef.current = 0;
     lastCommentIdRef.current = 0;
   }, [marketId]);
@@ -481,30 +486,40 @@ export function MarketDetailPage() {
   }
 
   const chartData = useMemo(() => {
-    if (chartRows.length === 0) return [];
-    const t0 = chartRows[0].t;
-    return chartRows.map((r, i) => ({
+    if (chartTrades.length === 0) return [];
+    const firstTs = Date.parse(chartTrades[0]?.at ?? "");
+    return chartTrades.map((r, i) => {
+      const ts = Date.parse(r.at ?? "");
+      const sec =
+        Number.isFinite(firstTs) && Number.isFinite(ts)
+          ? (ts - firstTs) / 1000
+          : i;
+      return {
       i,
-      sec: Math.round((r.t - t0) / 100) / 10,
-      mid: Math.round(r.mid * 1000) / 10,
-      meanBelief: r.meanBelief != null ? Math.round(r.meanBelief * 1000) / 10 : null,
-      pStar: r.groundTruth != null ? Math.round(r.groundTruth * 1000) / 10 : null,
-    }));
-  }, [chartRows]);
+      sec,
+      mid: Math.round(Number(r.price) * 1000) / 10,
+      pStar:
+        detail?.ground_truth != null && Number.isFinite(Number(detail.ground_truth))
+          ? Math.round(Number(detail.ground_truth) * 1000) / 10
+          : null,
+      };
+    });
+  }, [chartTrades, detail?.ground_truth]);
 
   const newsMarkers = useMemo(() => {
-    if (chartRows.length === 0 || newsHistory.length === 0) return [];
-    const t0 = chartRows[0].t;
+    if (chartTrades.length === 0 || newsHistory.length === 0) return [];
+    const t0 = Date.parse(chartTrades[0]?.at ?? "");
+    if (!Number.isFinite(t0)) return [];
     return newsHistory
       .map((ev) => {
         const ts = Date.parse(ev.at_timestamp);
         if (!Number.isFinite(ts)) return null;
-        const sec = Math.round(((ts - t0) / 1000) * 10) / 10;
+        const sec = (ts - t0) / 1000;
         return { id: ev.id, sec, headline: ev.headline };
       })
       .filter((x): x is { id: number; sec: number; headline: string } => x != null)
       .filter((x) => x.sec >= 0);
-  }, [chartRows, newsHistory]);
+  }, [chartTrades, newsHistory]);
 
   if (!Number.isFinite(marketId)) {
     return (
@@ -696,8 +711,8 @@ export function MarketDetailPage() {
           <h2>Live price</h2>
           <p className="pm-muted small" style={{ marginTop: "-0.25rem", marginBottom: "0.5rem" }}>
             <strong>Green</strong> = {isCda ? "CDA reference/book mid" : "LMSR mid (inventory)"}.
-            <strong> Purple</strong> = mean belief over agents in this market. <strong>Amber dashed</strong> = scenario
-            P* (ground truth). Trade feed shows execution prices.
+            <strong> Amber dashed</strong> = scenario P* (ground truth). Loaded from persisted trades on page open,
+            then appends new trades live.
           </p>
           <div className="pm-chart-wrap">
             {chartData.length === 0 ? (
@@ -705,7 +720,13 @@ export function MarketDetailPage() {
             ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                  <XAxis dataKey="sec" tick={{ fontSize: 11 }} stroke="#64748b" unit="s" />
+                  <XAxis
+                    dataKey="sec"
+                    tick={{ fontSize: 11 }}
+                    stroke="#64748b"
+                    unit="s"
+                    tickFormatter={(v) => Number(v).toFixed(1)}
+                  />
                   <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11 }} stroke="#64748b" />
                   <Tooltip
                     formatter={(v: number | string, name: string) => [
@@ -724,7 +745,7 @@ export function MarketDetailPage() {
                     />
                   ))}
                   <Line
-                    type="monotone"
+                    type="linear"
                     dataKey="mid"
                     name={chartPriceName}
                     stroke="#22c55e"
@@ -733,17 +754,7 @@ export function MarketDetailPage() {
                     isAnimationActive={false}
                   />
                   <Line
-                    type="monotone"
-                    dataKey="meanBelief"
-                    name="Mean belief"
-                    stroke="#7c3aed"
-                    strokeWidth={2}
-                    dot={false}
-                    connectNulls
-                    isAnimationActive={false}
-                  />
-                  <Line
-                    type="monotone"
+                    type="linear"
                     dataKey="pStar"
                     name="P* (ground truth)"
                     stroke="#d97706"

@@ -913,7 +913,7 @@ def list_market_agents(
 def list_trades(
     market_id: int,
     since: Optional[int] = Query(None, description="Only trades with id > since"),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=100000),
 ) -> Dict[str, Any]:
     svc = get_market_service()
     try:
