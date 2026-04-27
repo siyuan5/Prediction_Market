@@ -33,8 +33,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 _VALID_MARKET_STATUSES = {"created", "open", "running", "stopped"}
 _TRADEABLE_STATUSES = {"open", "running"}
+_INITIAL_BELIEF_NOISE_STD = 0.10
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS markets (
@@ -74,6 +77,7 @@ CREATE TABLE IF NOT EXISTS positions (
     agent_id   INTEGER NOT NULL REFERENCES agents(id),
     market_id  INTEGER NOT NULL REFERENCES markets(id),
     yes_shares REAL    NOT NULL DEFAULT 0.0,
+    belief     REAL,
     UNIQUE(agent_id, market_id)
 );
 
@@ -147,6 +151,7 @@ class MarketStore:
             self.conn.executescript(_SCHEMA)
             self._owns_conn = True
         self._migrate_agents_schema()
+        self._migrate_positions_schema()
 
     def _migrate_agents_schema(self) -> None:
         """
@@ -168,6 +173,26 @@ class MarketStore:
         if "deleted_at" not in cols:
             self.conn.execute("ALTER TABLE agents ADD COLUMN deleted_at TEXT")
 
+    def _migrate_positions_schema(self) -> None:
+        """Ensure positions has a per-market belief column and backfill it."""
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(positions)").fetchall()
+        }
+        if "belief" not in cols:
+            self.conn.execute("ALTER TABLE positions ADD COLUMN belief REAL")
+            self.conn.execute(
+                """
+                UPDATE positions
+                SET belief = (
+                    SELECT a.belief
+                    FROM agents a
+                    WHERE a.id = positions.agent_id
+                )
+                WHERE belief IS NULL
+                """
+            )
+
     def close(self) -> None:
         if self._owns_conn:
             self.conn.close()
@@ -180,6 +205,51 @@ class MarketStore:
         else:
             with self.conn:
                 yield
+
+    @staticmethod
+    def _belief_seed(agent_id: int, market_id: int) -> int:
+        """Stable seed for reproducible per-(agent, market) noise."""
+        return (
+            (int(agent_id) * 1_000_003) ^ (int(market_id) * 9_176) ^ 0x9E3779B9
+        ) & 0xFFFFFFFF
+
+    def _initial_position_belief(self, agent_row: sqlite3.Row, market_row: sqlite3.Row) -> float:
+        """Initial market-specific belief from market truth/prior plus deterministic noise."""
+        if market_row["ground_truth"] is not None:
+            center = float(market_row["ground_truth"])
+        elif agent_row["belief"] is not None:
+            center = float(agent_row["belief"])
+        else:
+            center = 0.5
+        rng = np.random.default_rng(self._belief_seed(int(agent_row["id"]), int(market_row["id"])))
+        noisy = center + float(rng.normal(0.0, _INITIAL_BELIEF_NOISE_STD))
+        return float(np.clip(noisy, 0.01, 0.99))
+
+    def _ensure_position_row(self, agent_id: int, market_id: int) -> None:
+        """
+        Insert missing position row using deterministic noisy initial belief.
+
+        Caller is responsible for wrapping this in a transaction.
+        """
+        agent = self.conn.execute(
+            "SELECT id, belief FROM agents WHERE id = ? AND deleted_at IS NULL",
+            (agent_id,),
+        ).fetchone()
+        if agent is None:
+            raise ValueError(f"Agent {agent_id} not found")
+        market = self.conn.execute(
+            "SELECT id, ground_truth FROM markets WHERE id = ?",
+            (market_id,),
+        ).fetchone()
+        if market is None:
+            raise ValueError(f"Market {market_id} not found")
+        initial_belief = self._initial_position_belief(agent, market)
+        self.conn.execute(
+            "INSERT INTO positions (agent_id, market_id, yes_shares, belief) "
+            "VALUES (?, ?, 0.0, ?) "
+            "ON CONFLICT(agent_id, market_id) DO NOTHING",
+            (agent_id, market_id, initial_belief),
+        )
 
     # ── LMSR math (pure functions) ─────────────────────────────────────
 
@@ -365,19 +435,50 @@ class MarketStore:
                 (outcome, now, market_id),
             )
             positions = self.conn.execute(
-                "SELECT agent_id, yes_shares FROM positions WHERE market_id = ?",
+                """
+                SELECT p.agent_id, p.yes_shares, a.name, a.cash
+                FROM positions p
+                JOIN agents a ON a.id = p.agent_id
+                WHERE p.market_id = ?
+                """,
                 (market_id,),
             ).fetchall()
+            settled_rows: List[Dict[str, Any]] = []
+            total_payout = 0.0
             for pos in positions:
-                payout = pos["yes_shares"] * payoff
+                yes_shares = float(pos["yes_shares"])
+                payout = yes_shares * payoff
                 self.conn.execute(
                     "UPDATE agents SET cash = cash + ? WHERE id = ?",
                     (payout, pos["agent_id"]),
                 )
+                total_payout += float(payout)
+                settled_rows.append(
+                    {
+                        "agent_id": int(pos["agent_id"]),
+                        "name": str(pos["name"]),
+                        "yes_shares": yes_shares,
+                        "payout": float(payout),
+                        "cash_after": float(pos["cash"]) + float(payout),
+                    }
+                )
+        winners = sorted(
+            settled_rows,
+            key=lambda row: (-float(row["payout"]), int(row["agent_id"])),
+        )[:10]
+        losers = sorted(
+            settled_rows,
+            key=lambda row: (float(row["payout"]), int(row["agent_id"])),
+        )[:10]
         return {
             "market_id": market_id,
             "outcome": outcome,
+            "payoff_per_yes_share": payoff,
             "positions_settled": len(positions),
+            "total_payout": float(total_payout),
+            "winners": winners,
+            "losers": losers,
+            "resolved_at": now,
         }
 
     # ── Agents ─────────────────────────────────────────────────────────
@@ -477,19 +578,18 @@ class MarketStore:
             )
         return self.get_agent(agent_id)
 
-    def set_agent_belief(self, agent_id: int, new_belief: float) -> float:
-        """Update global agent belief and return the previous value."""
+    def set_agent_belief(self, agent_id: int, market_id: int, new_belief: float) -> float:
+        """Update per-market belief and return the previous market belief."""
         with self._transaction():
+            self._ensure_position_row(agent_id, market_id)
             row = self.conn.execute(
-                "SELECT belief FROM agents WHERE id = ? AND deleted_at IS NULL",
-                (agent_id,),
+                "SELECT belief FROM positions WHERE agent_id = ? AND market_id = ?",
+                (agent_id, market_id),
             ).fetchone()
-            if row is None:
-                raise ValueError(f"Agent {agent_id} not found")
-            old_belief = row["belief"]
+            old_belief = row["belief"] if row is not None else None
             self.conn.execute(
-                "UPDATE agents SET belief = ? WHERE id = ?",
-                (new_belief, agent_id),
+                "UPDATE positions SET belief = ? WHERE agent_id = ? AND market_id = ?",
+                (new_belief, agent_id, market_id),
             )
         return old_belief
 
@@ -525,6 +625,7 @@ class MarketStore:
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
+            self._ensure_position_row(agent_id, market_id)
             self.conn.execute(
                 "UPDATE agents SET cash = cash + ? WHERE id = ?",
                 (cash_delta, agent_id),
@@ -546,24 +647,7 @@ class MarketStore:
     def ensure_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
         """Lazy-create an agent/market position row if it doesn't exist."""
         with self._transaction():
-            agent = self.conn.execute(
-                "SELECT id FROM agents WHERE id = ? AND deleted_at IS NULL",
-                (agent_id,),
-            ).fetchone()
-            if agent is None:
-                raise ValueError(f"Agent {agent_id} not found")
-            market = self.conn.execute(
-                "SELECT id FROM markets WHERE id = ?",
-                (market_id,),
-            ).fetchone()
-            if market is None:
-                raise ValueError(f"Market {market_id} not found")
-            self.conn.execute(
-                "INSERT INTO positions (agent_id, market_id, yes_shares) "
-                "VALUES (?, ?, 0.0) "
-                "ON CONFLICT(agent_id, market_id) DO NOTHING",
-                (agent_id, market_id),
-            )
+            self._ensure_position_row(agent_id, market_id)
         return self.get_position(agent_id, market_id)
 
     def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
@@ -587,7 +671,9 @@ class MarketStore:
             "agent_id": row["agent_id"],
             "market_id": row["market_id"],
             "yes_shares": row["yes_shares"],
-            "belief": agent["belief"] if agent is not None else None,
+            "belief": row["belief"] if row["belief"] is not None else (
+                agent["belief"] if agent is not None else None
+            ),
             "rho": agent["rho"] if agent is not None else None,
             "personality": agent["personality"] if agent is not None else None,
         }
@@ -624,6 +710,7 @@ class MarketStore:
             ).fetchone()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found")
+            self._ensure_position_row(agent_id, market_id)
 
             b = mkt["b"]
             old_yes, old_no = mkt["inv_yes"], mkt["inv_no"]
@@ -772,6 +859,8 @@ class MarketStore:
                         break
                     self.conn.execute("UPDATE agents SET cash = cash - ? WHERE id = ?", (notional, agent_id))
                     self.conn.execute("UPDATE agents SET cash = cash + ? WHERE id = ?", (notional, resting["agent_id"]))
+                    self._ensure_position_row(agent_id, market_id)
+                    self._ensure_position_row(resting["agent_id"], market_id)
                     self.conn.execute(
                         "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
                         "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",
@@ -824,6 +913,8 @@ class MarketStore:
                         continue
                     self.conn.execute("UPDATE agents SET cash = cash + ? WHERE id = ?", (notional, agent_id))
                     self.conn.execute("UPDATE agents SET cash = cash - ? WHERE id = ?", (notional, resting["agent_id"]))
+                    self._ensure_position_row(agent_id, market_id)
+                    self._ensure_position_row(resting["agent_id"], market_id)
                     self.conn.execute(
                         "INSERT INTO positions (agent_id, market_id, yes_shares) VALUES (?, ?, ?) "
                         "ON CONFLICT(agent_id, market_id) DO UPDATE SET yes_shares = yes_shares + ?",

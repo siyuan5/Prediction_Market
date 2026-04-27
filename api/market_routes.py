@@ -191,6 +191,16 @@ class NewsEventRequest(BaseModel):
         return self
 
 
+class ResolveMarketRequest(BaseModel):
+    outcome: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "ResolveMarketRequest":
+        if self.outcome is not None and self.outcome not in ("yes", "no"):
+            raise ValueError("outcome must be 'yes' or 'no'")
+        return self
+
+
 def _http_from_value(err: ValueError, *, not_found: bool = False) -> None:
     msg = str(err)
     low = msg.lower()
@@ -262,11 +272,16 @@ def create_agent(body: AgentCreateRequest) -> Dict[str, Any]:
     else:
         personality_dict = sample_personality(DEFAULT_POPULATION_DIST).to_dict()
     personality_json = json.dumps(personality_dict)
+    # Keep default belief market-independent but non-degenerate so autonomous
+    # agents can still discover edges and start trading without manual seeding.
+    initial_belief = body.belief
+    if initial_belief is None:
+        initial_belief = float(np.clip(0.5 + random.uniform(-0.2, 0.2), 0.01, 0.99))
     try:
         agent = svc.create_agent(
             body.name,
             body.cash,
-            belief=body.belief,
+            belief=initial_belief,
             rho=body.rho,
             personality=personality_json,
         )
@@ -289,8 +304,12 @@ def list_global_agents(
 ) -> Dict[str, Any]:
     svc = get_market_service()
     data = svc.list_agents(limit=limit, offset=offset)
+    rows = [_agent_response_row(a) for a in data["agents"]]
+    means = svc.mean_belief_joined_markets_by_agent([int(a["agent_id"]) for a in rows])
+    for row in rows:
+        row["avg_joined_belief"] = means.get(int(row["agent_id"]))
     return {
-        "agents": [_agent_response_row(a) for a in data["agents"]],
+        "agents": rows,
         "total": int(data["total"]),
     }
 
@@ -303,7 +322,9 @@ def get_global_agent(agent_id: int) -> Dict[str, Any]:
         agent = svc.get_agent(agent_id)
     except ValueError as e:
         _http_from_value(e, not_found=True)
-    return _agent_response_row(agent)
+    row = _agent_response_row(agent)
+    row["avg_joined_belief"] = svc.mean_belief_joined_markets_by_agent([int(agent_id)]).get(int(agent_id))
+    return row
 
 
 @agents_router.get("/agents/{agent_id}/markets")
@@ -520,6 +541,8 @@ def get_market_detail(market_id: int) -> Dict[str, Any]:
         "title": str(m.get("title") or ""),
         "slug": m.get("slug"),
         "status": str(m.get("status") or ""),
+        "resolution": m.get("resolution"),
+        "resolved_at": m.get("resolved_at"),
         "mechanism": str(m.get("mechanism") or ""),
         "ground_truth": float(m.get("ground_truth") or 0.5),
         "b": float(m.get("b") or 0.0),
@@ -527,6 +550,41 @@ def get_market_detail(market_id: int) -> Dict[str, Any]:
         "trade_count": tc,
         "active_agents": aa,
     }
+
+
+@router.post("/{market_id}/resolve")
+def resolve_market(market_id: int, body: Optional[ResolveMarketRequest] = None) -> Dict[str, Any]:
+    """Resolve one market and return settlement summary (winners/losers/payout)."""
+    svc = get_market_service()
+    try:
+        mkt = svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+
+    runner = get_agent_runner()
+    if runner.is_running(market_id):
+        try:
+            runner.stop_market(market_id)
+        except ValueError:
+            pass
+
+    requested_outcome = body.outcome if body is not None else None
+    resolution_draw_u: Optional[float] = None
+    if requested_outcome is None:
+        ground_truth = float(mkt.get("ground_truth") or 0.5)
+        resolution_draw_u = float(random.random())
+        requested_outcome = "yes" if resolution_draw_u < ground_truth else "no"
+
+    try:
+        settlement = svc.resolve_market(market_id, requested_outcome)
+    except ValueError as e:
+        _http_from_value(e)
+    if resolution_draw_u is not None:
+        settlement["resolution_draw_u"] = resolution_draw_u
+        settlement["resolution_mode"] = "ground_truth_draw"
+    else:
+        settlement["resolution_mode"] = "manual_override"
+    return settlement
 
 
 @router.get("/{market_id}/comments")
@@ -570,8 +628,8 @@ def tick_market_comments(market_id: int) -> Dict[str, Any]:
     else:
         trade_flow = "hold"
     try:
-        ag = svc.get_agent(agent_id, None)
-        belief = float(ag.get("belief") or 0.5)
+        pos = svc.get_position(agent_id, mid)
+        belief = float(pos.get("belief") or 0.5)
     except ValueError:
         belief = 0.5
     price = float(t.get("price_after") or svc.get_price(mid))
@@ -627,7 +685,7 @@ def get_market_price(market_id: int) -> Dict[str, Any]:
     ts = datetime.now(timezone.utc).isoformat()
     m = svc.get_market(market_id)
     ground_truth = float(m.get("ground_truth") or 0.5)
-    mean_belief = svc.mean_belief_all_agents()
+    mean_belief = svc.mean_belief_for_market(market_id)
     if snap.get("mechanism") == "lmsr":
         return {
             "market_id": market_id,
@@ -747,14 +805,13 @@ def get_one_agent(market_id: int, agent_id: int) -> Dict[str, Any]:
     ic = _market_initial_cash.get(market_id, 100.0)
     shares = float(pos.get("yes_shares") or 0.0)
     pnl = float(ag["cash"]) + shares * float(price) - ic
-    # Belief and personality come from the global agent record, not the position,
-    # so that agent personalities remain independent of the markets they trade in.
+    # Personality remains global, but belief is market-specific from the position.
     parsed: Any = _parse_personality(ag.get("personality"))
     return {
         "agent_id": agent_id,
         "cash": float(ag["cash"]),
         "shares": shares,
-        "belief": float(ag["belief"]) if ag.get("belief") is not None else 0.5,
+        "belief": float(pos["belief"]) if pos.get("belief") is not None else 0.5,
         "rho": float(ag["rho"]) if ag.get("rho") is not None else 1.0,
         "pnl": pnl,
         "personality": parsed,
@@ -827,14 +884,13 @@ def list_market_agents(
         svc.get_market(market_id)
     except ValueError as e:
         _http_from_value(e, not_found=True)
-    rows = svc.list_agents(limit=1_000_000, offset=0)["agents"]
+    rows = svc.list_agents_for_market(market_id)
     price = svc.get_price(market_id)
     ic = _market_initial_cash.get(market_id, 100.0)
     out: List[Dict[str, Any]] = []
     for r in rows[offset : offset + limit]:
-        aid = int(r["id"])
-        pos = svc.get_position(aid, market_id)
-        sh = float(pos.get("yes_shares") or 0)
+        aid = int(r["agent_id"])
+        sh = float(r.get("yes_shares") or 0)
         cash = float(r["cash"])
         bel = float(r["belief"]) if r.get("belief") is not None else 0.5
         rho = float(r["rho"]) if r.get("rho") is not None else 1.0
@@ -857,7 +913,7 @@ def list_market_agents(
 def list_trades(
     market_id: int,
     since: Optional[int] = Query(None, description="Only trades with id > since"),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=100000),
 ) -> Dict[str, Any]:
     svc = get_market_service()
     try:
@@ -897,8 +953,8 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
     except ValueError as e:
         _http_from_value(e, not_found=True)
 
-    rows = svc.list_agents(limit=1_000_000, offset=0)["agents"]
-    by_id = {int(r["id"]): r for r in rows}
+    rows = svc.list_agents_for_market(market_id)
+    by_id = {int(r["agent_id"]): r for r in rows}
 
     selected: List[Dict[str, Any]] = []
     if body.agent_ids is not None:
@@ -922,7 +978,7 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
     else:
         scored: List[Tuple[float, int, Dict[str, Any]]] = []
         for row in rows:
-            aid = int(row["id"])
+            aid = int(row["agent_id"])
             personality = _parse_personality(row.get("personality"))
             sensitivity, stubbornness = _signal_profile(personality)
             if sensitivity + 1e-12 < body.min_signal_sensitivity:
@@ -939,7 +995,7 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
 
     changed: List[Dict[str, Any]] = []
     for row in selected:
-        aid = int(row["id"])
+        aid = int(row["agent_id"])
         old_belief = float(row["belief"]) if row.get("belief") is not None else 0.5
         personality = _parse_personality(row.get("personality"))
         sensitivity, stubbornness = _signal_profile(personality)

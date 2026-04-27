@@ -205,8 +205,10 @@ export function AgentDetailPage() {
         <div>
           <h1 className="pm-detail-title">{agent?.name ?? (loading ? "Loading..." : `Agent #${agentId}`)}</h1>
           <p className="pm-muted">
-            Agent #{agentId} · belief {fmtPct(agent?.belief)} · rho {agent?.rho != null ? agent.rho.toFixed(2) : "--"}
+            Agent #{agentId} · base belief {fmtPct(agent?.belief)} · rho{" "}
+            {agent?.rho != null ? agent.rho.toFixed(2) : "--"}
           </p>
+          <p className="pm-muted small">Live beliefs are market-specific and shown in each market view.</p>
           <p className="pm-muted small">{agent ? personalitySummary(agent.personality ?? {}) : "Loading profile..."}</p>
           {agent ? (
             <button

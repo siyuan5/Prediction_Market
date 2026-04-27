@@ -123,15 +123,12 @@ export function AutonomousMarketPanel() {
     try {
       const runTag = Date.now();
       for (let i = 0; i < nAgents; i += 1) {
-        const beliefNoise = (Math.random() - 0.5) * 0.2;
-        const belief = Math.min(0.99, Math.max(0.01, groundTruth + beliefNoise));
         const agentRes = await fetch("/api/agents/create", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             name: `ui-auto-${runTag}-${i}`,
             cash: 100.0,
-            belief,
             rho: 1.0,
             personality: {
               check_interval_mean: 2.0,
