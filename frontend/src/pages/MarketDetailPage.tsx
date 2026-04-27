@@ -87,6 +87,7 @@ export function MarketDetailPage() {
   const [price, setPrice] = useState<PriceSnap | null>(null);
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [chartTrades, setChartTrades] = useState<TradeRow[]>([]);
+  const [meanBeliefSamples, setMeanBeliefSamples] = useState<{ t: number; meanBelief: number }[]>([]);
   const [book, setBook] = useState<{ bids: { price: number; quantity: number }[]; asks: { price: number; quantity: number }[] } | null>(null);
   const [comments, setComments] = useState<CommentRow[]>([]);
   const [running, setRunning] = useState(false);
@@ -157,6 +158,10 @@ export function MarketDetailPage() {
     if (!res.ok) throw new Error(await res.text());
     const p = (await res.json()) as PriceSnap;
     setPrice(p);
+    if (p.mean_belief != null && Number.isFinite(Number(p.mean_belief))) {
+      const sample = { t: Date.now(), meanBelief: Number(p.mean_belief) };
+      setMeanBeliefSamples((prev) => [...prev, sample].slice(-3000));
+    }
   }, [marketId]);
 
   const fetchTrades = useCallback(async () => {
@@ -224,6 +229,7 @@ export function MarketDetailPage() {
 
   useEffect(() => {
     setChartTrades([]);
+    setMeanBeliefSamples([]);
     lastTradeIdRef.current = 0;
     lastCommentIdRef.current = 0;
   }, [marketId]);
@@ -488,23 +494,40 @@ export function MarketDetailPage() {
   const chartData = useMemo(() => {
     if (chartTrades.length === 0) return [];
     const firstTs = Date.parse(chartTrades[0]?.at ?? "");
+    const beliefPoints =
+      Number.isFinite(firstTs)
+        ? meanBeliefSamples
+            .map((s) => ({ sec: (s.t - firstTs) / 1000, meanBelief: s.meanBelief }))
+            .filter((x) => Number.isFinite(x.sec))
+            .sort((a, b) => a.sec - b.sec)
+        : [];
     return chartTrades.map((r, i) => {
       const ts = Date.parse(r.at ?? "");
       const sec =
         Number.isFinite(firstTs) && Number.isFinite(ts)
           ? (ts - firstTs) / 1000
           : i;
+      let meanBelief: number | null = null;
+      if (beliefPoints.length > 0) {
+        for (let j = beliefPoints.length - 1; j >= 0; j -= 1) {
+          if (beliefPoints[j].sec <= sec) {
+            meanBelief = Math.round(beliefPoints[j].meanBelief * 1000) / 10;
+            break;
+          }
+        }
+      }
       return {
       i,
       sec,
       mid: Math.round(Number(r.price) * 1000) / 10,
+      meanBelief,
       pStar:
         detail?.ground_truth != null && Number.isFinite(Number(detail.ground_truth))
           ? Math.round(Number(detail.ground_truth) * 1000) / 10
           : null,
       };
     });
-  }, [chartTrades, detail?.ground_truth]);
+  }, [chartTrades, detail?.ground_truth, meanBeliefSamples]);
 
   const newsMarkers = useMemo(() => {
     if (chartTrades.length === 0 || newsHistory.length === 0) return [];
@@ -711,8 +734,9 @@ export function MarketDetailPage() {
           <h2>Live price</h2>
           <p className="pm-muted small" style={{ marginTop: "-0.25rem", marginBottom: "0.5rem" }}>
             <strong>Green</strong> = {isCda ? "CDA reference/book mid" : "LMSR mid (inventory)"}.
-            <strong> Amber dashed</strong> = scenario P* (ground truth). Loaded from persisted trades on page open,
-            then appends new trades live.
+            <strong> Purple</strong> = mean belief over agents in this market.
+            <strong> Amber dashed</strong> = scenario P* (ground truth). Loaded from persisted trades on page open, then
+            appends new trades live.
           </p>
           <div className="pm-chart-wrap">
             {chartData.length === 0 ? (
@@ -751,6 +775,16 @@ export function MarketDetailPage() {
                     stroke="#22c55e"
                     strokeWidth={2}
                     dot={false}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="linear"
+                    dataKey="meanBelief"
+                    name="Mean belief"
+                    stroke="#7c3aed"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls
                     isAnimationActive={false}
                   />
                   <Line
