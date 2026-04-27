@@ -1,11 +1,10 @@
 """
 Autonomous CRRA trader that polls the market API and submits trades.
 
-Agent beliefs and personalities are initialised at construction time and remain
-independent of any market the agent participates in.  The ``signal_sensitivity``
-and ``stubbornness`` personality fields govern how much external belief updates
-(e.g. from news events that change the global agent belief in the DB) are
-incorporated into the agent's internal belief state each cycle.
+Agents keep one belief per market (in-memory cache), seeded from the initial
+agent profile and refreshed from the API's market-specific agent state. The
+``signal_sensitivity`` and ``stubbornness`` personality fields govern how much
+incoming belief updates are blended into each market-specific belief.
 """
 
 from __future__ import annotations
@@ -28,8 +27,8 @@ except ImportError:
 class AutonomousAgent:
     """Polls the API, computes a CRRA trade, and optionally submits it.
 
-    The agent owns its belief state.  Markets never override it; external belief
-    changes (news events, manual updates) are incorporated only through the
+    The agent maintains belief per market. External belief changes (news events,
+    manual updates) are blended into each market belief through the
     ``signal_sensitivity`` / ``stubbornness`` personality filter.
     """
 
@@ -50,6 +49,7 @@ class AutonomousAgent:
         self.agent_id = int(agent_id)
         self.api_base_url = str(api_base_url).rstrip("/")
         self.belief = float(belief)
+        self._base_belief = self.belief
         self.rho = float(rho)
         self.cash = float(cash)
         self.timeout = float(timeout)
@@ -58,6 +58,7 @@ class AutonomousAgent:
         self.session = requests.Session()
         self._stop_flag = threading.Event()
         self._shares_by_market: Dict[int, float] = {}
+        self._belief_by_market: Dict[int, float] = {}
         # When set (by AgentRunner), only those markets are considered after discovery.
         self._allowed_market_ids = allowed_market_ids
 
@@ -127,9 +128,11 @@ class AutonomousAgent:
         for market in markets:
             try:
                 price = float(market["price"])
+                mid = int(market.get("id", market.get("market_id", -1)))
             except (KeyError, TypeError, ValueError):
                 continue
-            scored.append((abs(self.belief - price), market))
+            belief = float(self._belief_by_market.get(mid, self.belief))
+            scored.append((abs(belief - price), market))
 
         if scored:
             scored.sort(key=lambda item: item[0], reverse=True)
@@ -220,16 +223,14 @@ class AutonomousAgent:
         agent_state = self.get_agent_state(market_id)
 
         price = float(price_snapshot["price"])
+        belief = float(self._belief_by_market.get(market_id, self.belief))
         if agent_state is None:
             cash = self.cash
             shares = float(self._shares_by_market.get(market_id, 0.0))
             rho = self.rho
         else:
-            # Market state provides cash, shares, and rho — all market-specific.
-            # Belief is NOT copied directly from the market; instead, we check
-            # whether the global agent belief was externally updated (e.g. by a
-            # news event) and incorporate it through the personality filter so
-            # the agent's beliefs stay agent-owned, not market-owned.
+            # Market state provides cash, shares, rho, and a market-specific
+            # belief target. Blend incoming belief updates through personality.
             cash = float(agent_state["cash"])
             shares = float(agent_state["shares"])
             rho = float(agent_state["rho"])
@@ -237,19 +238,21 @@ class AutonomousAgent:
             self.rho = rho
             self._shares_by_market[market_id] = shares
 
-            global_belief_raw = agent_state.get("belief")
-            if global_belief_raw is not None:
-                global_belief = float(global_belief_raw)
-                if abs(global_belief - self.belief) > 1e-9:
+            market_belief_raw = agent_state.get("belief")
+            if market_belief_raw is not None:
+                market_belief = float(market_belief_raw)
+                if abs(market_belief - belief) > 1e-9:
                     # Apply signal_sensitivity and stubbornness to blend the
-                    # externally-updated global belief into the agent's state.
+                    # externally-updated market belief into the local state.
                     sensitivity = min(max(self._p("signal_sensitivity"), 0.0), 1.0)
                     stubbornness = min(max(self._p("stubbornness"), 0.0), 1.0)
                     influence = sensitivity * (1.0 - stubbornness)
-                    raw = self.belief + influence * (global_belief - self.belief)
-                    self.belief = max(0.01, min(0.99, raw))
+                    raw = belief + influence * (market_belief - belief)
+                    belief = max(0.01, min(0.99, raw))
+            self._belief_by_market[market_id] = belief
 
-        belief = self.belief
+        self._belief_by_market[market_id] = belief
+        self.belief = belief
 
         x_star = compute_optimal_trade(
             belief=belief,

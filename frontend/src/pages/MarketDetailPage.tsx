@@ -8,6 +8,8 @@ type Detail = {
   mechanism: string;
   /** open | running | stopped | … */
   status: string;
+  resolution?: "yes" | "no" | null;
+  resolved_at?: string | null;
   ground_truth: number;
   price: number;
   trade_count: number;
@@ -24,7 +26,7 @@ type PriceSnap = {
   timestamp: string;
   /** Hidden P(Yes) for this market (scenario). */
   ground_truth?: number | null;
-  /** Mean belief over all agents in the DB (same idea as Classic “mean belief”). */
+  /** Mean belief across agents participating in this market. */
   mean_belief?: number | null;
 };
 
@@ -57,6 +59,25 @@ type NewsEventRow = {
   at_timestamp: string;
 };
 
+type SettlementRow = {
+  agent_id: number;
+  name: string;
+  yes_shares: number;
+  payout: number;
+  cash_after: number;
+};
+
+type SettlementResult = {
+  market_id: number;
+  outcome: "yes" | "no";
+  payoff_per_yes_share: number;
+  positions_settled: number;
+  total_payout: number;
+  winners: SettlementRow[];
+  losers: SettlementRow[];
+  resolved_at: string;
+};
+
 export function MarketDetailPage() {
   const navigate = useNavigate();
   const { marketId: midParam } = useParams();
@@ -65,11 +86,10 @@ export function MarketDetailPage() {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [price, setPrice] = useState<PriceSnap | null>(null);
   const [trades, setTrades] = useState<TradeRow[]>([]);
+  const [chartTrades, setChartTrades] = useState<TradeRow[]>([]);
+  const [meanBeliefSamples, setMeanBeliefSamples] = useState<{ t: number; meanBelief: number }[]>([]);
   const [book, setBook] = useState<{ bids: { price: number; quantity: number }[]; asks: { price: number; quantity: number }[] } | null>(null);
   const [comments, setComments] = useState<CommentRow[]>([]);
-  const [chartRows, setChartRows] = useState<
-    { t: number; mid: number; meanBelief: number | null; groundTruth: number | null }[]
-  >([]);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -88,6 +108,24 @@ export function MarketDetailPage() {
   const [serverTradeTotal, setServerTradeTotal] = useState<number | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [newsHistory, setNewsHistory] = useState<NewsEventRow[]>([]);
+  const [showResolve, setShowResolve] = useState(false);
+  const [resolveBusy, setResolveBusy] = useState(false);
+  const [settlement, setSettlement] = useState<SettlementResult | null>(null);
+
+  const mergeTradesUnique = useCallback((prev: TradeRow[], batch: TradeRow[], keepLast?: number): TradeRow[] => {
+    const byId = new Map<string, TradeRow>();
+    for (const row of prev) byId.set(String(row.trade_id), row);
+    for (const row of batch) byId.set(String(row.trade_id), row);
+    const merged = Array.from(byId.values()).sort((a, b) => {
+      const ai = Number.parseInt(String(a.trade_id), 10) || 0;
+      const bi = Number.parseInt(String(b.trade_id), 10) || 0;
+      return ai - bi;
+    });
+    if (keepLast != null && keepLast > 0 && merged.length > keepLast) {
+      return merged.slice(-keepLast);
+    }
+    return merged;
+  }, []);
 
   const loadDetail = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
@@ -120,22 +158,17 @@ export function MarketDetailPage() {
     if (!res.ok) throw new Error(await res.text());
     const p = (await res.json()) as PriceSnap;
     setPrice(p);
-    const t = Date.now();
-    const mid = Number(p.price);
-    const mb =
-      p.mean_belief != null && Number.isFinite(Number(p.mean_belief)) ? Number(p.mean_belief) : null;
-    const gt =
-      p.ground_truth != null && Number.isFinite(Number(p.ground_truth)) ? Number(p.ground_truth) : null;
-    setChartRows((rows) => {
-      const next = [...rows, { t, mid, meanBelief: mb, groundTruth: gt }];
-      return next.slice(-240);
-    });
+    if (p.mean_belief != null && Number.isFinite(Number(p.mean_belief))) {
+      const sample = { t: Date.now(), meanBelief: Number(p.mean_belief) };
+      setMeanBeliefSamples((prev) => [...prev, sample].slice(-3000));
+    }
   }, [marketId]);
 
   const fetchTrades = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
     const since = lastTradeIdRef.current;
-    const q = since > 0 ? `?since=${since}&limit=80` : "?limit=80";
+    const initialLimit = Math.max(500, Number(detail?.trade_count ?? 500));
+    const q = since > 0 ? `?since=${since}&limit=80` : `?limit=${initialLimit}`;
     const res = await fetch(`/api/market/${marketId}/trades${q}`);
     if (!res.ok) throw new Error(await res.text());
     const data = (await res.json()) as { trades: TradeRow[]; total?: number };
@@ -144,10 +177,11 @@ export function MarketDetailPage() {
     }
     const batch = data.trades ?? [];
     if (batch.length === 0) return;
-    setTrades((prev) => [...prev, ...batch].slice(-200));
+    setChartTrades((prev) => mergeTradesUnique(prev, batch));
+    setTrades((prev) => mergeTradesUnique(prev, batch, 200));
     const maxId = Math.max(since, ...batch.map((t) => Number.parseInt(t.trade_id, 10) || 0));
     lastTradeIdRef.current = maxId;
-  }, [marketId]);
+  }, [marketId, detail?.trade_count, mergeTradesUnique]);
 
   const fetchBook = useCallback(async () => {
     if (!Number.isFinite(marketId) || detail?.mechanism !== "cda") return;
@@ -194,7 +228,8 @@ export function MarketDetailPage() {
   }, [loadDetail, refreshGlobalAgentCount]);
 
   useEffect(() => {
-    setChartRows([]);
+    setChartTrades([]);
+    setMeanBeliefSamples([]);
     lastTradeIdRef.current = 0;
     lastCommentIdRef.current = 0;
   }, [marketId]);
@@ -337,7 +372,7 @@ export function MarketDetailPage() {
     if (
       !window.confirm(
         `Delete "${label}"? This removes the market and its history. ` +
-          `Traders who only participated here are removed from the pool; others are kept.`,
+          `Agents are kept in the global pool.`,
       )
     ) {
       return;
@@ -383,20 +418,18 @@ export function MarketDetailPage() {
     setBusy(true);
     setError(null);
     setSpawnNotice(null);
-    const gt = detail.ground_truth;
     try {
       const tag = Date.now();
       for (let i = 0; i < demoN; i += 1) {
-        const beliefNoise = (Math.random() - 0.5) * 0.2;
-        const belief = Math.min(0.99, Math.max(0.01, gt + beliefNoise));
+        // Sample heterogeneous risk aversion so spawned agents are not identical.
+        const rho = 0.5 + Math.random() * 1.5;
         const res = await fetch("/api/agents", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             name: `trader-${tag}-${i}`,
             cash: 100.0,
-            belief,
-            rho: 1.0,
+            rho: Math.round(rho * 100) / 100,
           }),
         });
         if (!res.ok) throw new Error(await res.text());
@@ -436,31 +469,80 @@ export function MarketDetailPage() {
     }
   }
 
+  async function resolveMarket() {
+    setResolveBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/market/${marketId}/resolve`, {
+        method: "POST",
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const payload = (await res.json()) as SettlementResult;
+      setSettlement(payload);
+      setRunning(false);
+      setShowResolve(false);
+      tickRef.current += 1;
+      await loadDetail();
+      await fetchPrice();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setResolveBusy(false);
+    }
+  }
+
   const chartData = useMemo(() => {
-    if (chartRows.length === 0) return [];
-    const t0 = chartRows[0].t;
-    return chartRows.map((r, i) => ({
+    if (chartTrades.length === 0) return [];
+    const firstTs = Date.parse(chartTrades[0]?.at ?? "");
+    const beliefPoints =
+      Number.isFinite(firstTs)
+        ? meanBeliefSamples
+            .map((s) => ({ sec: (s.t - firstTs) / 1000, meanBelief: s.meanBelief }))
+            .filter((x) => Number.isFinite(x.sec))
+            .sort((a, b) => a.sec - b.sec)
+        : [];
+    return chartTrades.map((r, i) => {
+      const ts = Date.parse(r.at ?? "");
+      const sec =
+        Number.isFinite(firstTs) && Number.isFinite(ts)
+          ? (ts - firstTs) / 1000
+          : i;
+      let meanBelief: number | null = null;
+      if (beliefPoints.length > 0) {
+        for (let j = beliefPoints.length - 1; j >= 0; j -= 1) {
+          if (beliefPoints[j].sec <= sec) {
+            meanBelief = Math.round(beliefPoints[j].meanBelief * 1000) / 10;
+            break;
+          }
+        }
+      }
+      return {
       i,
-      sec: Math.round((r.t - t0) / 100) / 10,
-      mid: Math.round(r.mid * 1000) / 10,
-      meanBelief: r.meanBelief != null ? Math.round(r.meanBelief * 1000) / 10 : null,
-      pStar: r.groundTruth != null ? Math.round(r.groundTruth * 1000) / 10 : null,
-    }));
-  }, [chartRows]);
+      sec,
+      mid: Math.round(Number(r.price) * 1000) / 10,
+      meanBelief,
+      pStar:
+        detail?.ground_truth != null && Number.isFinite(Number(detail.ground_truth))
+          ? Math.round(Number(detail.ground_truth) * 1000) / 10
+          : null,
+      };
+    });
+  }, [chartTrades, detail?.ground_truth, meanBeliefSamples]);
 
   const newsMarkers = useMemo(() => {
-    if (chartRows.length === 0 || newsHistory.length === 0) return [];
-    const t0 = chartRows[0].t;
+    if (chartTrades.length === 0 || newsHistory.length === 0) return [];
+    const t0 = Date.parse(chartTrades[0]?.at ?? "");
+    if (!Number.isFinite(t0)) return [];
     return newsHistory
       .map((ev) => {
         const ts = Date.parse(ev.at_timestamp);
         if (!Number.isFinite(ts)) return null;
-        const sec = Math.round(((ts - t0) / 1000) * 10) / 10;
+        const sec = (ts - t0) / 1000;
         return { id: ev.id, sec, headline: ev.headline };
       })
       .filter((x): x is { id: number; sec: number; headline: string } => x != null)
       .filter((x) => x.sec >= 0);
-  }, [chartRows, newsHistory]);
+  }, [chartTrades, newsHistory]);
 
   if (!Number.isFinite(marketId)) {
     return (
@@ -475,6 +557,9 @@ export function MarketDetailPage() {
     price?.last_trade_price != null && Number.isFinite(Number(price.last_trade_price))
       ? Math.round(Number(price.last_trade_price) * 1000) / 10
       : null;
+  const isCda = detail?.mechanism === "cda";
+  const livePriceLabel = isCda ? "Reference Yes (book mid)" : "Implied Yes (LMSR mid)";
+  const chartPriceName = isCda ? "Book mid / reference" : "LMSR mid";
 
   return (
     <div className="pm-page pm-detail">
@@ -510,7 +595,7 @@ export function MarketDetailPage() {
           ) : null}
         </div>
         <div className="pm-detail-yes-block" aria-live="polite">
-          <div className="pm-yes-huge-label">Implied Yes (LMSR mid)</div>
+          <div className="pm-yes-huge-label">{livePriceLabel}</div>
           <div className="pm-yes-huge">{midPct != null ? `${midPct}%` : "—"}</div>
           {lastPrintPct != null ? (
             <div className="pm-ts">Last trade print: {lastPrintPct}%</div>
@@ -529,67 +614,129 @@ export function MarketDetailPage() {
         </div>
       ) : null}
 
-      <section className="pm-panel pm-controls-panel">
-        <h2 className="pm-controls-title">Trading controls</h2>
-        <p className="pm-muted small" style={{ marginTop: 0 }}>
-          <strong>1.</strong> Spawn adds traders to the global pool. <strong>2.</strong>{" "}
-          <strong>Start trading</strong> turns on autonomous activity (nothing happens until then). With many agents,
-          different IDs will show in the feed over time—not only one.
-        </p>
-        <div className="pm-controls-grid">
-          <div className="pm-control-block">
-            <span className="pm-control-label">Step 1 — Agents</span>
-            <div className="pm-inline">
-              <label>
-                Count
-                <input
-                  type="number"
-                  min={1}
-                  max={200}
-                  value={demoN}
-                  onChange={(e) => setDemoN(Number(e.target.value))}
-                  disabled={busy}
-                />
-              </label>
-              <button type="button" className="pm-btn-secondary" disabled={busy} onClick={spawnDemoAgents}>
-                Spawn agents
-              </button>
+      {detail?.status === "resolved" ? (
+        <section className="pm-panel pm-controls-panel">
+          <h2 className="pm-controls-title">Market resolved</h2>
+          <p className="pm-muted small" style={{ marginTop: 0 }}>
+            Outcome: <strong>{(settlement?.outcome ?? detail.resolution ?? "unknown").toUpperCase()}</strong>
+            {detail.resolved_at ? ` · ${new Date(detail.resolved_at).toLocaleString()}` : ""}
+          </p>
+          <p className="pm-muted small">
+            Positions settled: <strong>{settlement?.positions_settled ?? "n/a"}</strong> · Total payout:{" "}
+            <strong>
+              {typeof settlement?.total_payout === "number" ? settlement.total_payout.toFixed(2) : "n/a"}
+            </strong>
+          </p>
+          {settlement ? (
+            <div className="pm-two-col">
+              <section className="pm-panel">
+                <h3>Top payouts</h3>
+                <div className="pm-feed">
+                  {settlement.winners.length === 0 ? (
+                    <span className="pm-muted">No settled traders.</span>
+                  ) : (
+                    settlement.winners.slice(0, 5).map((row) => (
+                      <div key={`w-${row.agent_id}`} className="pm-feed-row">
+                        Agent {row.agent_id} ({row.name}) · {row.yes_shares.toFixed(2)} shares · payout{" "}
+                        {row.payout.toFixed(2)}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </section>
+              <section className="pm-panel">
+                <h3>Lowest payouts</h3>
+                <div className="pm-feed">
+                  {settlement.losers.length === 0 ? (
+                    <span className="pm-muted">No settled traders.</span>
+                  ) : (
+                    settlement.losers.slice(0, 5).map((row) => (
+                      <div key={`l-${row.agent_id}`} className="pm-feed-row">
+                        Agent {row.agent_id} ({row.name}) · {row.yes_shares.toFixed(2)} shares · payout{" "}
+                        {row.payout.toFixed(2)}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </section>
+            </div>
+          ) : (
+            <p className="pm-muted small" style={{ marginBottom: 0 }}>
+              This market is already resolved. Detailed winner/loser payout rows appear immediately after resolution.
+            </p>
+          )}
+        </section>
+      ) : (
+        <section className="pm-panel pm-controls-panel">
+          <h2 className="pm-controls-title">Trading controls</h2>
+          <p className="pm-muted small" style={{ marginTop: 0 }}>
+            <strong>1.</strong> Spawn adds traders to the global pool. <strong>2.</strong>{" "}
+            <strong>Start trading</strong> turns on autonomous activity (nothing happens until then). With many agents,
+            different IDs will show in the feed over time—not only one.
+          </p>
+          <div className="pm-controls-grid">
+            <div className="pm-control-block">
+              <span className="pm-control-label">Step 1 — Agents</span>
+              <div className="pm-inline">
+                <label>
+                  Count
+                  <input
+                    type="number"
+                    min={1}
+                    max={200}
+                    value={demoN}
+                    onChange={(e) => setDemoN(Number(e.target.value))}
+                    disabled={busy || resolveBusy}
+                  />
+                </label>
+                <button type="button" className="pm-btn-secondary" disabled={busy || resolveBusy} onClick={spawnDemoAgents}>
+                  Spawn agents
+                </button>
+              </div>
+            </div>
+            <div className="pm-control-block pm-control-primary">
+              <span className="pm-control-label">Step 2 — Autonomous engine</span>
+              <div className="pm-toolbar">
+                <button type="button" className="pm-btn-primary" disabled={busy || resolveBusy || running} onClick={handleStart}>
+                  Start trading
+                </button>
+                <button type="button" className="pm-btn-danger" disabled={busy || resolveBusy || !running} onClick={handleStop}>
+                  Stop
+                </button>
+                <button type="button" className="pm-btn-secondary" disabled={busy || resolveBusy} onClick={() => setShowNews(true)}>
+                  News event
+                </button>
+                <button
+                  type="button"
+                  className="pm-btn-success"
+                  disabled={busy || resolveBusy}
+                  onClick={() => setShowResolve(true)}
+                >
+                  Resolve market
+                </button>
+              </div>
+              {running ? (
+                <p className="pm-running-pill" aria-live="polite">
+                  Running — autonomous traders are active for this market
+                </p>
+              ) : (
+                <p className="pm-muted small" style={{ margin: "0.35rem 0 0" }}>
+                  Not running yet — press <strong>Start trading</strong> after spawning agents.
+                </p>
+              )}
             </div>
           </div>
-          <div className="pm-control-block pm-control-primary">
-            <span className="pm-control-label">Step 2 — Autonomous engine</span>
-            <div className="pm-toolbar">
-              <button type="button" className="pm-btn-primary" disabled={busy || running} onClick={handleStart}>
-                Start trading
-              </button>
-              <button type="button" className="pm-btn-danger" disabled={busy || !running} onClick={handleStop}>
-                Stop
-              </button>
-              <button type="button" className="pm-btn-secondary" disabled={busy} onClick={() => setShowNews(true)}>
-                News event
-              </button>
-            </div>
-            {running ? (
-              <p className="pm-running-pill" aria-live="polite">
-                Running — autonomous traders are active for this market
-              </p>
-            ) : (
-              <p className="pm-muted small" style={{ margin: "0.35rem 0 0" }}>
-                Not running yet — press <strong>Start trading</strong> after spawning agents.
-              </p>
-            )}
-          </div>
-        </div>
-      </section>
+        </section>
+      )}
 
       <div className="pm-two-col">
         <section className="pm-panel pm-grow">
           <h2>Live price</h2>
           <p className="pm-muted small" style={{ marginTop: "-0.25rem", marginBottom: "0.5rem" }}>
-            <strong>Green</strong> = LMSR mid (inventory). <strong>Purple</strong> = mean belief over{" "}
-            <strong>every</strong> agent in the DB (global pool), like the roster—not only traders tied to this market.{" "}
-            <strong>Amber dashed</strong> = scenario P* (ground truth). Same idea as Classic &quot;Mean belief vs
-            price&quot;—mid can still pin near 0%/100% while beliefs sit near P*. Trade feed shows execution prices.
+            <strong>Green</strong> = {isCda ? "CDA reference/book mid" : "LMSR mid (inventory)"}.
+            <strong> Purple</strong> = mean belief over agents in this market.
+            <strong> Amber dashed</strong> = scenario P* (ground truth). Loaded from persisted trades on page open, then
+            appends new trades live.
           </p>
           <div className="pm-chart-wrap">
             {chartData.length === 0 ? (
@@ -597,7 +744,13 @@ export function MarketDetailPage() {
             ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                  <XAxis dataKey="sec" tick={{ fontSize: 11 }} stroke="#64748b" unit="s" />
+                  <XAxis
+                    dataKey="sec"
+                    tick={{ fontSize: 11 }}
+                    stroke="#64748b"
+                    unit="s"
+                    tickFormatter={(v) => Number(v).toFixed(1)}
+                  />
                   <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11 }} stroke="#64748b" />
                   <Tooltip
                     formatter={(v: number | string, name: string) => [
@@ -616,16 +769,16 @@ export function MarketDetailPage() {
                     />
                   ))}
                   <Line
-                    type="monotone"
+                    type="linear"
                     dataKey="mid"
-                    name="LMSR mid"
+                    name={chartPriceName}
                     stroke="#22c55e"
                     strokeWidth={2}
                     dot={false}
                     isAnimationActive={false}
                   />
                   <Line
-                    type="monotone"
+                    type="linear"
                     dataKey="meanBelief"
                     name="Mean belief"
                     stroke="#7c3aed"
@@ -635,7 +788,7 @@ export function MarketDetailPage() {
                     isAnimationActive={false}
                   />
                   <Line
-                    type="monotone"
+                    type="linear"
                     dataKey="pStar"
                     name="P* (ground truth)"
                     stroke="#d97706"
@@ -800,6 +953,32 @@ export function MarketDetailPage() {
                 </button>
                 <button type="button" className="pm-btn-primary" disabled={busy} onClick={postNews}>
                   Publish news
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showResolve ? (
+        <div className="pm-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="resolve-title">
+          <div className="pm-modal">
+            <h2 id="resolve-title">Resolve market</h2>
+            <p className="pm-muted">
+              Outcome is drawn automatically from the market&apos;s ground truth probability (P*). This closes the
+              market and settles payouts.
+            </p>
+            <div className="pm-form">
+              <div className="pm-modal-actions">
+                <button
+                  type="button"
+                  className="pm-btn-ghost"
+                  onClick={() => setShowResolve(false)}
+                  disabled={resolveBusy}
+                >
+                  Cancel
+                </button>
+                <button type="button" className="pm-btn-success" disabled={resolveBusy} onClick={resolveMarket}>
+                  {resolveBusy ? "Resolving..." : "Confirm resolution"}
                 </button>
               </div>
             </div>

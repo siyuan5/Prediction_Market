@@ -103,7 +103,7 @@ def test_delete_market_removes_row_and_children(client):
     body = d.json()
     assert body["deleted"] is True
     assert body["market_id"] == mid
-    assert body.get("agents_removed") == 1
+    assert body.get("agents_removed") == 0
 
     assert client.get(f"/api/market/{mid}/detail").status_code == 404
     listed = client.get("/api/markets?status=all&limit=200&offset=0")
@@ -112,7 +112,7 @@ def test_delete_market_removes_row_and_children(client):
     assert mid not in ids
     pool = client.get("/api/agents?limit=500&offset=0")
     assert pool.status_code == 200
-    assert not any(a["agent_id"] == aid for a in pool.json().get("agents", []))
+    assert any(a["agent_id"] == aid for a in pool.json().get("agents", []))
 
 
 def test_delete_market_keeps_agent_with_second_market(client):
@@ -139,7 +139,7 @@ def test_delete_market_keeps_agent_with_second_market(client):
     assert any(a["agent_id"] == aid for a in pool["agents"])
 
 
-def test_price_mean_belief_pools_all_agents(client):
+def test_price_mean_belief_is_market_scoped(client):
     _create_agent(client, name="m1", belief=0.5)
     _create_agent(client, name="m2", belief=0.7)
     r = client.post(
@@ -157,7 +157,7 @@ def test_price_mean_belief_pools_all_agents(client):
     assert pr.status_code == 200
     body = pr.json()
     assert body["ground_truth"] == pytest.approx(0.72)
-    assert body["mean_belief"] == pytest.approx(0.6)
+    assert body["mean_belief"] is None
 
 
 def test_delete_agent_hides_from_ui_but_keeps_trade_history(client):
@@ -216,6 +216,17 @@ def test_agents_create_list_patch_and_alias(client):
     assert p["cash"] == pytest.approx(180.0)
 
 
+def test_create_agent_without_belief_gets_market_independent_default(client):
+    res = client.post(
+        "/api/agents",
+        json={"name": "no-belief-default", "cash": 100.0},
+    )
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["belief"] is not None
+    assert 0.01 <= float(body["belief"]) <= 0.99
+
+
 def test_market_join_and_lmsr_trade(client):
     aid = _create_agent(client, name="trader")["agent_id"]
     mid = client.post(
@@ -235,6 +246,47 @@ def test_market_join_and_lmsr_trade(client):
     out = tr.json()
     assert out["trade_id"] is not None
     assert out["executed_quantity"] != 0
+
+
+def test_resolve_market_returns_settlement_and_blocks_trading(client, monkeypatch):
+    aid = _create_agent(client, name="settle-trader", belief=0.64)["agent_id"]
+    mid = client.post(
+        "/api/market/create",
+        json={"mechanism": "lmsr", "ground_truth": 0.7, "b": 90.0, "title": "resolve-api"},
+    ).json()["market_id"]
+
+    assert client.post(f"/api/market/{mid}/join", json={"agent_id": aid}).status_code == 200
+    trade = client.post(f"/api/market/{mid}/trade", json={"agent_id": aid, "quantity": 4.0})
+    assert trade.status_code == 200, trade.text
+    cash_after_trade = float(trade.json()["agent_cash_after"])
+
+    monkeypatch.setattr("api.market_routes.random.random", lambda: 0.05)
+    resolved = client.post(f"/api/market/{mid}/resolve")
+    assert resolved.status_code == 200, resolved.text
+    body = resolved.json()
+    assert body["market_id"] == mid
+    assert body["outcome"] == "yes"
+    assert body["resolution_mode"] == "ground_truth_draw"
+    assert body["resolution_draw_u"] == pytest.approx(0.05)
+    assert body["positions_settled"] == 1
+    assert "winners" in body and "losers" in body
+    assert isinstance(body["winners"], list)
+    assert isinstance(body["losers"], list)
+    assert body["total_payout"] > 0
+
+    detail = client.get(f"/api/market/{mid}/detail")
+    assert detail.status_code == 200, detail.text
+    d = detail.json()
+    assert d["status"] == "resolved"
+    assert d["resolution"] == "yes"
+    assert d["resolved_at"] is not None
+
+    profile = client.get(f"/api/market/{mid}/agent/{aid}")
+    assert profile.status_code == 200, profile.text
+    assert float(profile.json()["cash"]) > cash_after_trade
+
+    blocked = client.post(f"/api/market/{mid}/trade", json={"agent_id": aid, "quantity": 1.0})
+    assert blocked.status_code in (400, 409)
 
 
 def test_full_market_flow_with_news_injection(client):
@@ -258,6 +310,11 @@ def test_full_market_flow_with_news_injection(client):
     )
     assert created.status_code == 201, created.text
     mid = created.json()["market_id"]
+    for row in created_agents:
+        assert client.post(
+            f"/api/market/{mid}/join",
+            json={"agent_id": int(row["agent_id"])},
+        ).status_code == 200
 
     markets = client.get("/api/markets")
     assert markets.status_code == 200, markets.text

@@ -184,6 +184,49 @@ class MarketService:
             return None
         return float(np.mean(beliefs))
 
+    def mean_belief_for_market(self, market_id: int) -> Optional[float]:
+        """Mean belief across agents with a position in one market."""
+        rows = self.list_agents_for_market(market_id)
+        beliefs: List[float] = []
+        for r in rows:
+            b = r.get("belief")
+            if b is None:
+                continue
+            try:
+                beliefs.append(float(b))
+            except (TypeError, ValueError):
+                continue
+        if not beliefs:
+            return None
+        return float(np.mean(beliefs))
+
+    def mean_belief_joined_markets_by_agent(self, agent_ids: List[int]) -> Dict[int, Optional[float]]:
+        """
+        Mean position belief for each agent across all joined markets.
+
+        "Joined" means the agent has a row in ``positions`` for that market.
+        """
+        if not agent_ids:
+            return {}
+        ids = [int(x) for x in agent_ids]
+        out: Dict[int, Optional[float]] = {aid: None for aid in ids}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._get_store().conn.execute(
+            f"""
+            SELECT agent_id, AVG(belief) AS avg_belief
+            FROM positions
+            WHERE belief IS NOT NULL
+              AND agent_id IN ({placeholders})
+            GROUP BY agent_id
+            """,
+            ids,
+        ).fetchall()
+        for r in rows:
+            aid = int(r["agent_id"])
+            v = r["avg_belief"]
+            out[aid] = float(v) if v is not None else None
+        return out
+
     def get_position(self, agent_id: int, market_id: int) -> Dict[str, Any]:
         return self._get_store().get_position(agent_id, market_id)
 
@@ -210,7 +253,9 @@ class MarketService:
         store = self._get_store()
         rows = store.conn.execute(
             """
-            SELECT a.id AS agent_id, a.name, a.cash, a.belief, a.rho, a.personality,
+            SELECT a.id AS agent_id, a.name, a.cash,
+                   COALESCE(p.belief, a.belief) AS belief,
+                   a.rho, a.personality,
                    p.yes_shares
             FROM positions p
             JOIN agents a ON a.id = p.agent_id
@@ -300,11 +345,11 @@ class MarketService:
         """
         Remove a market and all trades, orders, and positions for it.
 
-        Deletes **orphan** agent rows: agents who only ever participated in this
-        market (no remaining positions, trades, or open orders anywhere).
+        Agent rows are intentionally preserved even if they only participated in
+        the deleted market.
 
         Returns:
-            Number of agent rows removed.
+            Number of agent rows removed (always 0).
         """
         with self._begin_immediate():
             store = self._get_store()
@@ -313,49 +358,12 @@ class MarketService:
             if row is None:
                 raise ValueError(f"Market {market_id} not found")
 
-            involved = conn.execute(
-                """
-                SELECT DISTINCT agent_id FROM (
-                    SELECT agent_id FROM trades WHERE market_id = ?
-                    UNION SELECT agent_id FROM positions WHERE market_id = ?
-                    UNION SELECT agent_id FROM orders WHERE market_id = ?
-                )
-                """,
-                (market_id, market_id, market_id),
-            ).fetchall()
-            agent_ids = [int(r[0]) for r in involved]
-
             conn.execute("DELETE FROM trades WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM orders WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM positions WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM news_events WHERE market_id = ?", (market_id,))
             conn.execute("DELETE FROM markets WHERE id = ?", (market_id,))
-
-            removed = 0
-            for aid in agent_ids:
-                n_pos = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM positions WHERE agent_id = ?",
-                        (aid,),
-                    ).fetchone()[0]
-                )
-                n_tr = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM trades WHERE agent_id = ?",
-                        (aid,),
-                    ).fetchone()[0]
-                )
-                n_ord = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM orders WHERE agent_id = ? AND status = 'open'",
-                        (aid,),
-                    ).fetchone()[0]
-                )
-                if n_pos == 0 and n_tr == 0 and n_ord == 0:
-                    now = datetime.now(timezone.utc).isoformat()
-                    conn.execute("UPDATE agents SET deleted_at = ? WHERE id = ?", (now, aid))
-                    removed += 1
-            return removed
+            return 0
 
     def delete_agent(self, agent_id: int) -> Dict[str, Any]:
         """
@@ -381,7 +389,7 @@ class MarketService:
 
     def set_agent_belief(self, market_id: int, agent_id: int, new_belief: float) -> float:
         with self._begin_immediate():
-            return self._get_store().set_agent_belief(agent_id, new_belief)
+            return self._get_store().set_agent_belief(agent_id, market_id, new_belief)
 
     def update_agent_portfolio(
         self, market_id: int, agent_id: int, cash_delta: float, shares_delta: float,

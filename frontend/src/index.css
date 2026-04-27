@@ -821,6 +821,7 @@ label.checkbox-row input[type="checkbox"] {
 .pm-btn-primary,
 .pm-btn-secondary,
 .pm-btn-ghost,
+.pm-btn-success,
 .pm-btn-danger {
   font-weight: 600;
   font-size: 0.88rem;
@@ -834,6 +835,7 @@ label.checkbox-row input[type="checkbox"] {
 .pm-btn-primary:disabled,
 .pm-btn-secondary:disabled,
 .pm-btn-ghost:disabled,
+.pm-btn-success:disabled,
 .pm-btn-danger:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -863,10 +865,13 @@ label.checkbox-row input[type="checkbox"] {
   color: #b91c1c;
 }
 
+.pm-btn-success {
+  background: linear-gradient(135deg, #16a34a 0%, #15803d 100%);
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(22, 163, 74, 0.35);
+}
+
 .pm-controls-panel {
-  position: sticky;
-  top: 0;
-  z-index: 20;
   box-shadow: 0 8px 32px rgba(15, 23, 42, 0.08);
 }
 

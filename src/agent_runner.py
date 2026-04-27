@@ -227,9 +227,19 @@ class AgentRunner:
                     personality = parsed
             except json.JSONDecodeError:
                 personality = None
+        raw_belief = row.get("belief")
+        if raw_belief is None:
+            # Keep initialization market-independent while avoiding a degenerate
+            # 0.5 prior for legacy agents that were created without belief.
+            aid_for_seed = int(row.get("agent_id", row.get("id")))
+            belief_rng = aid_for_seed * 1_000_003 + 17_389
+            frac = (belief_rng % 10_000) / 10_000.0
+            belief = max(0.01, min(0.99, 0.35 + 0.30 * frac))
+        else:
+            belief = float(raw_belief)
         return _AgentSeed(
             agent_id=int(row.get("agent_id", row.get("id"))),
-            belief=float(row.get("belief") or 0.5),
+            belief=belief,
             rho=float(row.get("rho") or 1.0),
             cash=float(row.get("cash") or 0.0),
             personality=personality,

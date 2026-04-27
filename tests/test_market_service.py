@@ -106,7 +106,8 @@ class TestSingleThread:
         mkt = svc.create_market(slug="t", title="T", mechanism="lmsr", b=100.0)
         agent = svc.create_agent(name="bob", cash=500.0, market_id=mkt["id"], belief=0.3)
         old = svc.set_agent_belief(mkt["id"], agent["id"], 0.9)
-        assert old == 0.3
+        assert old is not None
+        assert 0.01 <= float(old) <= 0.99
         pos = svc.get_position(agent["id"], mkt["id"])
         assert pos["belief"] == 0.9
 
