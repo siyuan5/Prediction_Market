@@ -39,6 +39,9 @@ class Personality:
     # fraction of CRRA-optimal trade to execute per cycle, matches round-based
     # trade_fraction=0.20 default that prevents buy/liquidate oscillation
     trade_fraction: float = 0.20
+    # weight on the crowd-belief signal sourced from recent comments; gated
+    # globally by COMMENTS_INFLUENCE_TRADERS, zero default = no effect
+    comment_influence: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         """Serialize to plain dict (JSON-safe)."""
@@ -57,6 +60,7 @@ class Personality:
             signal_sensitivity=float(d.get("signal_sensitivity", defaults.signal_sensitivity)),
             stubbornness=float(d.get("stubbornness", defaults.stubbornness)),
             trade_fraction=float(d.get("trade_fraction", defaults.trade_fraction)),
+            comment_influence=float(d.get("comment_influence", defaults.comment_influence)),
         )
 
 
@@ -71,6 +75,7 @@ DEFAULT_POPULATION_DIST: Dict[str, Any] = {
     "signal_sensitivity": {"dist": "fixed", "value": 0.50},
     "stubbornness": {"dist": "fixed", "value": 0.30},
     "trade_fraction": {"dist": "fixed", "value": 0.20},
+    "comment_influence": {"dist": "uniform", "low": 0.0, "high": 0.3},
 }
 
 

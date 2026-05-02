@@ -10,11 +10,17 @@ incoming belief updates are blended into each market-specific belief.
 from __future__ import annotations
 
 import logging
+import os
 import random
 import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 
 import requests
+
+
+def _comments_influence_enabled() -> bool:
+    raw = os.environ.get("COMMENTS_INFLUENCE_TRADERS", "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 try:
     from .crra_math import compute_optimal_trade
@@ -157,6 +163,34 @@ class AutonomousAgent:
             )
         return response.json()
 
+    def get_crowd_belief(self, market_id: int) -> Optional[float]:
+        """Fetch the recent-comments crowd-belief signal for *market_id*.
+
+        Returns ``None`` on any error or when no recent comments exist; the
+        caller treats that as "no signal" and skips the blend. The endpoint
+        is cheap and the agent loop must never crash on its failure.
+        """
+        try:
+            response = self.session.get(
+                self._url(f"/market/{market_id}/comments/crowd_belief"),
+                timeout=self.timeout,
+            )
+        except requests.RequestException:
+            return None
+        if response.status_code >= 400:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        cb = payload.get("crowd_belief")
+        if cb is None:
+            return None
+        try:
+            return float(cb)
+        except (TypeError, ValueError):
+            return None
+
     def get_agent_state(self, market_id: int) -> Optional[Dict[str, Any]]:
         response = self.session.get(
             self._url(f"/market/{market_id}/agent/{self.agent_id}"),
@@ -250,6 +284,19 @@ class AutonomousAgent:
                     raw = belief + influence * (market_belief - belief)
                     belief = max(0.01, min(0.99, raw))
             self._belief_by_market[market_id] = belief
+
+        # Optional crowd-belief signal from recent comments. Gated globally by
+        # COMMENTS_INFLUENCE_TRADERS so existing simulations are unaffected by
+        # default. Each agent's reactivity is tuned by personality.comment_influence.
+        comment_weight = min(max(self._p("comment_influence"), 0.0), 1.0)
+        if _comments_influence_enabled() and comment_weight > 0.0:
+            crowd_belief = self.get_crowd_belief(market_id)
+            if crowd_belief is not None:
+                stubbornness = min(max(self._p("stubbornness"), 0.0), 1.0)
+                influence = comment_weight * (1.0 - stubbornness)
+                raw = belief + influence * (crowd_belief - belief)
+                belief = max(0.01, min(0.99, raw))
+                self._belief_by_market[market_id] = belief
 
         self._belief_by_market[market_id] = belief
         self.belief = belief

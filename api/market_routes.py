@@ -657,11 +657,67 @@ def tick_market_comments(market_id: int) -> Dict[str, Any]:
         "agent_id": agent_id,
         "text": text,
         "source": source,
+        "belief": float(belief),
         "at": datetime.now(timezone.utc).isoformat(),
     }
     _market_comment_rows.setdefault(mid, []).append(row)
     _trade_cursor_for_comments[mid] = tid
     return {"appended": 1, "comments": [row]}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+@router.get("/{market_id}/comments/crowd_belief")
+def get_market_crowd_belief(market_id: int) -> Dict[str, Any]:
+    """Aggregate belief of recent commenters; used as an optional trader signal.
+
+    Toggled by env ``COMMENTS_INFLUENCE_TRADERS`` on the consumer side; this
+    endpoint always returns the value so callers can observe it independently.
+    Window size is controlled by ``COMMENT_INFLUENCE_WINDOW_SEC`` (default 300).
+    """
+    svc = get_market_service()
+    try:
+        svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    mid = int(market_id)
+    window = max(1, _env_int("COMMENT_INFLUENCE_WINDOW_SEC", 300))
+    rows = _market_comment_rows.get(mid, [])
+    now = datetime.now(timezone.utc)
+    beliefs: List[float] = []
+    for r in rows:
+        b = r.get("belief")
+        at = r.get("at")
+        if b is None or at is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(at))
+            age = (now - ts).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if age <= window:
+            beliefs.append(float(b))
+    if not beliefs:
+        return {
+            "market_id": mid,
+            "crowd_belief": None,
+            "sample_size": 0,
+            "window_seconds": window,
+        }
+    return {
+        "market_id": mid,
+        "crowd_belief": sum(beliefs) / len(beliefs),
+        "sample_size": len(beliefs),
+        "window_seconds": window,
+    }
 
 
 @router.get("/{market_id}/price")
