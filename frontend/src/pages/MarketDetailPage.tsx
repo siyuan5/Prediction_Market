@@ -30,6 +30,12 @@ type PriceSnap = {
   mean_belief?: number | null;
 };
 
+type MeanBeliefSeriesResponse = {
+  market_id: number;
+  samples: Array<{ t: string; mean_belief: number }>;
+  total: number;
+};
+
 type TradeRow = {
   trade_id: string;
   agent_id: number;
@@ -77,6 +83,8 @@ type SettlementResult = {
   losers: SettlementRow[];
   resolved_at: string;
 };
+
+const MAX_MEAN_BELIEF_SAMPLES = 3000;
 
 export function MarketDetailPage() {
   const navigate = useNavigate();
@@ -127,6 +135,25 @@ export function MarketDetailPage() {
     return merged;
   }, []);
 
+  const mergeMeanBeliefSamples = useCallback(
+    (
+      prev: { t: number; meanBelief: number }[],
+      batch: { t: number; meanBelief: number }[],
+    ): { t: number; meanBelief: number }[] => {
+      const keyed = new Map<string, { t: number; meanBelief: number }>();
+      for (const row of prev) {
+        keyed.set(`${row.t}|${row.meanBelief}`, row);
+      }
+      for (const row of batch) {
+        keyed.set(`${row.t}|${row.meanBelief}`, row);
+      }
+      return Array.from(keyed.values())
+        .sort((a, b) => a.t - b.t)
+        .slice(-MAX_MEAN_BELIEF_SAMPLES);
+    },
+    [],
+  );
+
   const loadDetail = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
     try {
@@ -159,14 +186,37 @@ export function MarketDetailPage() {
     const p = (await res.json()) as PriceSnap;
     setPrice(p);
     if (p.mean_belief != null && Number.isFinite(Number(p.mean_belief))) {
-      const sample = { t: Date.now(), meanBelief: Number(p.mean_belief) };
-      setMeanBeliefSamples((prev) => [...prev, sample].slice(-3000));
+      const parsedTs = Date.parse(String(p.timestamp ?? ""));
+      const sample = {
+        t: Number.isFinite(parsedTs) ? parsedTs : Date.now(),
+        meanBelief: Number(p.mean_belief),
+      };
+      setMeanBeliefSamples((prev) => mergeMeanBeliefSamples(prev, [sample]));
     }
-  }, [marketId]);
+  }, [marketId, mergeMeanBeliefSamples]);
+
+  const fetchMeanBeliefSeries = useCallback(async () => {
+    if (!Number.isFinite(marketId)) return;
+    const res = await fetch(`/api/market/${marketId}/mean-belief-series?limit=${MAX_MEAN_BELIEF_SAMPLES}`);
+    if (!res.ok) throw new Error(await res.text());
+    const payload = (await res.json()) as MeanBeliefSeriesResponse;
+    const restored = (payload.samples ?? [])
+      .map((s) => {
+        const parsedTs = Date.parse(String(s.t ?? ""));
+        const meanBelief = Number(s.mean_belief);
+        if (!Number.isFinite(parsedTs) || !Number.isFinite(meanBelief)) return null;
+        return { t: parsedTs, meanBelief };
+      })
+      .filter((x): x is { t: number; meanBelief: number } => x != null);
+    setMeanBeliefSamples((prev) => mergeMeanBeliefSamples(prev, restored));
+  }, [marketId, mergeMeanBeliefSamples]);
 
   const fetchTrades = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
     const since = lastTradeIdRef.current;
+    // On first page load, wait until detail has authoritative trade_count so
+    // we can rebuild chart history instead of falling back to a 500-row window.
+    if (since === 0 && (detail?.trade_count == null)) return;
     const initialLimit = Math.max(500, Number(detail?.trade_count ?? 500));
     const q = since > 0 ? `?since=${since}&limit=80` : `?limit=${initialLimit}`;
     const res = await fetch(`/api/market/${marketId}/trades${q}`);
@@ -233,6 +283,25 @@ export function MarketDetailPage() {
     lastTradeIdRef.current = 0;
     lastCommentIdRef.current = 0;
   }, [marketId]);
+
+  useEffect(() => {
+    if (!Number.isFinite(marketId)) return;
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) return;
+      try {
+        await fetchMeanBeliefSeries();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    };
+    void run();
+    const id = window.setInterval(run, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [marketId, fetchMeanBeliefSeries]);
 
   useEffect(() => {
     if (!Number.isFinite(marketId)) return;
@@ -492,39 +561,64 @@ export function MarketDetailPage() {
   }
 
   const chartData = useMemo(() => {
-    if (chartTrades.length === 0) return [];
-    const firstTs = Date.parse(chartTrades[0]?.at ?? "");
-    const beliefPoints =
-      Number.isFinite(firstTs)
-        ? meanBeliefSamples
-            .map((s) => ({ sec: (s.t - firstTs) / 1000, meanBelief: s.meanBelief }))
-            .filter((x) => Number.isFinite(x.sec))
-            .sort((a, b) => a.sec - b.sec)
-        : [];
-    return chartTrades.map((r, i) => {
-      const ts = Date.parse(r.at ?? "");
-      const sec =
-        Number.isFinite(firstTs) && Number.isFinite(ts)
-          ? (ts - firstTs) / 1000
-          : i;
-      let meanBelief: number | null = null;
-      if (beliefPoints.length > 0) {
-        for (let j = beliefPoints.length - 1; j >= 0; j -= 1) {
-          if (beliefPoints[j].sec <= sec) {
-            meanBelief = Math.round(beliefPoints[j].meanBelief * 1000) / 10;
-            break;
-          }
-        }
+    const tradePoints = chartTrades
+      .map((r, i) => {
+        const ts = Date.parse(r.at ?? "");
+        if (!Number.isFinite(ts)) return null;
+        const price = Number(r.price);
+        if (!Number.isFinite(price)) return null;
+        return { idx: i, t: ts, mid: Math.round(price * 1000) / 10 };
+      })
+      .filter((row): row is { idx: number; t: number; mid: number } => row != null)
+      .sort((a, b) => a.t - b.t || a.idx - b.idx);
+
+    const beliefPoints = meanBeliefSamples
+      .map((s, i) => {
+        const t = Number(s.t);
+        const meanBelief = Number(s.meanBelief);
+        if (!Number.isFinite(t) || !Number.isFinite(meanBelief)) return null;
+        return { idx: i, t, meanBelief: Math.round(meanBelief * 1000) / 10 };
+      })
+      .filter((row): row is { idx: number; t: number; meanBelief: number } => row != null)
+      .sort((a, b) => a.t - b.t || a.idx - b.idx);
+
+    if (tradePoints.length === 0 && beliefPoints.length === 0) return [];
+
+    let t0 = Number.POSITIVE_INFINITY;
+    if (tradePoints.length > 0) t0 = Math.min(t0, tradePoints[0].t);
+    if (beliefPoints.length > 0) t0 = Math.min(t0, beliefPoints[0].t);
+    if (!Number.isFinite(t0)) return [];
+
+    const timeline: number[] = [];
+    for (const tp of tradePoints) timeline.push(tp.t);
+    for (const bp of beliefPoints) timeline.push(bp.t);
+    timeline.sort((a, b) => a - b);
+
+    const uniqueTimeline: number[] = [];
+    let prevT: number | null = null;
+    for (const t of timeline) {
+      if (prevT == null || t !== prevT) uniqueTimeline.push(t);
+      prevT = t;
+    }
+
+    let tradeIdx = -1;
+    let beliefIdx = -1;
+    return uniqueTimeline.map((t, i) => {
+      while (tradeIdx + 1 < tradePoints.length && tradePoints[tradeIdx + 1].t <= t) {
+        tradeIdx += 1;
+      }
+      while (beliefIdx + 1 < beliefPoints.length && beliefPoints[beliefIdx + 1].t <= t) {
+        beliefIdx += 1;
       }
       return {
-      i,
-      sec,
-      mid: Math.round(Number(r.price) * 1000) / 10,
-      meanBelief,
-      pStar:
-        detail?.ground_truth != null && Number.isFinite(Number(detail.ground_truth))
-          ? Math.round(Number(detail.ground_truth) * 1000) / 10
-          : null,
+        i,
+        sec: (t - t0) / 1000,
+        mid: tradeIdx >= 0 ? tradePoints[tradeIdx].mid : null,
+        meanBelief: beliefIdx >= 0 ? beliefPoints[beliefIdx].meanBelief : null,
+        pStar:
+          detail?.ground_truth != null && Number.isFinite(Number(detail.ground_truth))
+            ? Math.round(Number(detail.ground_truth) * 1000) / 10
+            : null,
       };
     });
   }, [chartTrades, detail?.ground_truth, meanBeliefSamples]);

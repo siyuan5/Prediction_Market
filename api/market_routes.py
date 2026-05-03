@@ -55,6 +55,8 @@ _market_comment_rows: Dict[int, List[Dict[str, Any]]] = {}
 _market_comment_llm_budget: Dict[int, List[int]] = {}
 _trade_cursor_for_comments: Dict[int, int] = {}
 _comment_id_seq: Dict[int, int] = {}
+_market_mean_belief_series: Dict[int, List[Dict[str, Any]]] = {}
+_MAX_MEAN_BELIEF_SAMPLES = 20_000
 
 
 def reset_market_runtime() -> None:
@@ -71,6 +73,7 @@ def reset_market_runtime() -> None:
     _market_comment_llm_budget.clear()
     _trade_cursor_for_comments.clear()
     _comment_id_seq.clear()
+    _market_mean_belief_series.clear()
 
 
 def _db_path() -> str:
@@ -99,6 +102,32 @@ def get_agent_runner() -> AgentRunner:
             market_service=get_market_service(),
         )
     return _agent_runner
+
+
+def _append_mean_belief_sample(
+    market_id: int,
+    *,
+    mean_belief: Optional[float] = None,
+    at_timestamp: Optional[str] = None,
+) -> None:
+    """
+    Append an in-memory time-series point for mean market belief.
+
+    This series is API-authoritative for chart restoration across page navigations
+    (analogous to how trade history is sourced from the backend).
+    """
+    mid = int(market_id)
+    if mean_belief is None:
+        mean = get_market_service().mean_belief_for_market(mid)
+        if mean is None:
+            return
+        mean_belief = float(mean)
+    ts = str(at_timestamp) if at_timestamp is not None else datetime.now(timezone.utc).isoformat()
+    row = {"t": ts, "mean_belief": float(mean_belief)}
+    series = _market_mean_belief_series.setdefault(mid, [])
+    series.append(row)
+    if len(series) > _MAX_MEAN_BELIEF_SAMPLES:
+        del series[:-_MAX_MEAN_BELIEF_SAMPLES]
 
 
 # --- Pydantic request bodies (match FINAL_PHASE_TASKS contracts) ---
@@ -767,6 +796,22 @@ def get_market_price(market_id: int) -> Dict[str, Any]:
     }
 
 
+@router.get("/{market_id}/mean-belief-series")
+def get_mean_belief_series(
+    market_id: int,
+    limit: int = Query(10_000, ge=1, le=_MAX_MEAN_BELIEF_SAMPLES),
+) -> Dict[str, Any]:
+    """Return backend-kept mean-belief history for one market (oldest-first)."""
+    svc = get_market_service()
+    try:
+        svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    series = _market_mean_belief_series.get(int(market_id), [])
+    out = series[-int(limit):] if limit > 0 else []
+    return {"market_id": int(market_id), "samples": out, "total": len(series)}
+
+
 @router.get("/{market_id}/book")
 def get_order_book(market_id: int) -> Dict[str, Any]:
     svc = get_market_service()
@@ -802,6 +847,7 @@ def post_trade(market_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         ic = _market_initial_cash.get(market_id, 100.0)
         price = float(r["price_after"])
         pnl = float(ag["cash"]) + float(pos["yes_shares"]) * price - ic
+        _append_mean_belief_sample(int(market_id))
         return {
             "trade_id": r["trade_id"],
             "executed_quantity": r["quantity"],
@@ -832,6 +878,7 @@ def post_trade(market_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     ic = _market_initial_cash.get(market_id, 100.0)
     pnl = float(ag["cash"]) + float(pos["yes_shares"]) * px - ic
     tid = r["trades"][0]["trade_id"] if r.get("trades") else None
+    _append_mean_belief_sample(int(market_id))
     return {
         "trade_id": tid,
         "executed_quantity": r["filled_quantity"],
@@ -899,6 +946,7 @@ def post_agent_belief(
         svc.set_agent_belief(market_id, agent_id, new_b)
     except ValueError as e:
         _http_from_value(e, not_found=True)
+    _append_mean_belief_sample(int(market_id))
     return {
         "agent_id": agent_id,
         "old_belief": old,
@@ -1114,6 +1162,11 @@ def inject_news_event(market_id: int, body: NewsEventRequest) -> Dict[str, Any]:
         _http_from_value(e, not_found=True)
     result["news_event_id"] = int(persisted["id"])
     result["at_timestamp"] = str(persisted["at_timestamp"])
+    _append_mean_belief_sample(
+        int(market_id),
+        mean_belief=float(result["mean_belief_after"]),
+        at_timestamp=result["at_timestamp"],
+    )
     return result
 
 
@@ -1147,7 +1200,7 @@ def start_autonomous(market_id: int) -> Dict[str, Any]:
         n_active = runner.start_market(market_id)
     except ValueError as e:
         _http_from_value(e)
-
+    _append_mean_belief_sample(int(market_id))
     return {"status": "started", "n_agents_running": n_active}
 
 
