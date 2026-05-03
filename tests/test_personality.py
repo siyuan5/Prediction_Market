@@ -57,6 +57,7 @@ class TestPersonalityDefaults:
             "signal_sensitivity",
             "stubbornness",
             "trade_fraction",
+            "comment_influence",
         }
 
 
@@ -151,12 +152,16 @@ class TestSamplePersonality:
     def test_fixed_fields_are_constant(self):
         rng = random.Random(0)
         samples = [sample_personality(rng=rng) for _ in range(50)]
-        # Per DEFAULT_POPULATION_DIST: jitter, noise, sensitivity, stubbornness are fixed
+        # Per DEFAULT_POPULATION_DIST: jitter, noise, stubbornness are fixed.
         for p in samples:
             assert p.check_interval_jitter == pytest.approx(1.0)
             assert p.trade_size_noise == pytest.approx(0.20)
-            assert p.signal_sensitivity == pytest.approx(0.50)
             assert p.stubbornness == pytest.approx(0.30)
+
+    def test_signal_sensitivity_in_range(self):
+        rng = random.Random(0)
+        samples = [sample_personality(rng=rng).signal_sensitivity for _ in range(200)]
+        assert all(0.20 <= v <= 0.90 for v in samples)
 
     def test_custom_distribution_config(self):
         config = {
@@ -220,6 +225,10 @@ class TestDefaultPopulationDist:
         assert DEFAULT_POPULATION_DIST["participation_rate"]["dist"] == "uniform"
         assert DEFAULT_POPULATION_DIST["participation_rate"]["low"] == pytest.approx(0.50)
         assert DEFAULT_POPULATION_DIST["participation_rate"]["high"] == pytest.approx(1.0)
+
+        assert DEFAULT_POPULATION_DIST["signal_sensitivity"]["dist"] == "uniform"
+        assert DEFAULT_POPULATION_DIST["signal_sensitivity"]["low"] == pytest.approx(0.20)
+        assert DEFAULT_POPULATION_DIST["signal_sensitivity"]["high"] == pytest.approx(0.90)
 
 
 # ---------------------------------------------------------------------------

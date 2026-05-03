@@ -72,7 +72,9 @@ DEFAULT_POPULATION_DIST: Dict[str, Any] = {
     "edge_threshold": {"dist": "uniform", "low": 0.01, "high": 0.10},
     "participation_rate": {"dist": "uniform", "low": 0.50, "high": 1.0},
     "trade_size_noise": {"dist": "fixed", "value": 0.20},
-    "signal_sensitivity": {"dist": "fixed", "value": 0.50},
+    # Keep a bounded spread so news targeting can segment agents meaningfully
+    # while avoiding extreme always-ignore / always-follow behavior.
+    "signal_sensitivity": {"dist": "uniform", "low": 0.20, "high": 0.90},
     "stubbornness": {"dist": "fixed", "value": 0.30},
     "trade_fraction": {"dist": "fixed", "value": 0.20},
     "comment_influence": {"dist": "uniform", "low": 0.0, "high": 0.3},

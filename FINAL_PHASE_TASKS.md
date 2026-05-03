@@ -344,6 +344,7 @@ Starts autonomous trading for this market. Global agent threads discover this ma
 - `check_interval_mean` drawn from `Uniform(1.0, 4.0)`
 - `edge_threshold` drawn from `Uniform(0.01, 0.10)`
 - `participation_rate` drawn from `Uniform(0.50, 1.0)`
+- `signal_sensitivity` drawn from `Uniform(0.20, 0.90)`
 - Everything else fixed at the defaults above
 
 ---
