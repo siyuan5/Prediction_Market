@@ -264,6 +264,14 @@ export function MarketDetailPage() {
     setNewsHistory(data.events ?? []);
   }, [marketId]);
 
+  const fetchSettlement = useCallback(async () => {
+    if (!Number.isFinite(marketId)) return;
+    const res = await fetch(`/api/market/${marketId}/settlement`);
+    if (!res.ok) return;
+    const data = (await res.json()) as SettlementResult;
+    setSettlement(data);
+  }, [marketId]);
+
   const tickComments = useCallback(async () => {
     if (!Number.isFinite(marketId)) return;
     await fetch(`/api/market/${marketId}/comments/tick`, { method: "POST" });
@@ -419,6 +427,29 @@ export function MarketDetailPage() {
       window.clearInterval(id);
     };
   }, [marketId, fetchNewsHistory]);
+
+  useEffect(() => {
+    if (!Number.isFinite(marketId)) return;
+    if (detail?.status !== "resolved") {
+      setSettlement(null);
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) return;
+      try {
+        await fetchSettlement();
+      } catch {
+        /* ignore */
+      }
+    };
+    void run();
+    const id = window.setInterval(run, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [marketId, detail?.status, fetchSettlement]);
 
   async function handleStart() {
     setBusy(true);

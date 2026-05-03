@@ -616,6 +616,63 @@ def resolve_market(market_id: int, body: Optional[ResolveMarketRequest] = None) 
     return settlement
 
 
+@router.get("/{market_id}/settlement")
+def get_market_settlement(market_id: int) -> Dict[str, Any]:
+    """
+    Return settlement-style summary for an already-resolved market.
+
+    Reconstructs winners/losers from persisted market resolution + positions so
+    UI can rehydrate settlement details after navigation/reload.
+    """
+    svc = get_market_service()
+    try:
+        mkt = svc.get_market(market_id)
+    except ValueError as e:
+        _http_from_value(e, not_found=True)
+    status = str(mkt.get("status") or "")
+    if status != "resolved":
+        raise HTTPException(status_code=409, detail=f"market {market_id} is not resolved")
+    outcome = str(mkt.get("resolution") or "no")
+    payoff = 1.0 if outcome == "yes" else 0.0
+    rows = svc.list_agents_for_market(market_id)
+    settled_rows: List[Dict[str, Any]] = []
+    total_payout = 0.0
+    for row in rows:
+        yes_shares = float(row.get("yes_shares") or 0.0)
+        payout = yes_shares * payoff
+        total_payout += float(payout)
+        settled_rows.append(
+            {
+                "agent_id": int(row["agent_id"]),
+                "name": str(row.get("name") or f"Agent {row['agent_id']}"),
+                "yes_shares": yes_shares,
+                "payout": float(payout),
+                # Current cash can drift after settlement if agent trades elsewhere.
+                # Keep this field for UI compatibility.
+                "cash_after": float(row.get("cash") or 0.0),
+            }
+        )
+    winners = sorted(
+        settled_rows,
+        key=lambda x: (-float(x["payout"]), int(x["agent_id"])),
+    )[:10]
+    losers = sorted(
+        settled_rows,
+        key=lambda x: (float(x["payout"]), int(x["agent_id"])),
+    )[:10]
+    return {
+        "market_id": int(market_id),
+        "outcome": outcome,
+        "payoff_per_yes_share": payoff,
+        "positions_settled": len(settled_rows),
+        "total_payout": float(total_payout),
+        "winners": winners,
+        "losers": losers,
+        "resolved_at": mkt.get("resolved_at"),
+        "resolution_mode": "persisted_snapshot",
+    }
+
+
 @router.get("/{market_id}/comments")
 def list_market_comments(market_id: int, since: int = 0) -> Dict[str, Any]:
     """Return trader comments appended by ``POST .../comments/tick`` (newest last)."""
