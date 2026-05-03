@@ -654,6 +654,10 @@ export function MarketDetailPage() {
   const isCda = detail?.mechanism === "cda";
   const livePriceLabel = isCda ? "Reference Yes (book mid)" : "Implied Yes (LMSR mid)";
   const chartPriceName = isCda ? "Book mid / reference" : "LMSR mid";
+  const pStarPct =
+    detail?.ground_truth != null && Number.isFinite(Number(detail.ground_truth))
+      ? `${(Number(detail.ground_truth) * 100).toFixed(1)}%`
+      : "—";
 
   return (
     <div className="pm-page pm-detail">
@@ -672,11 +676,15 @@ export function MarketDetailPage() {
       <header className="pm-detail-head">
         <div>
           <h1 className="pm-detail-title">{detail?.title ?? "Loading…"}</h1>
-          <p className="pm-muted">
-            {detail?.mechanism?.toUpperCase()} · P* {(detail?.ground_truth ?? 0) * 100}% · {detail?.trade_count ?? 0}{" "}
-            trades · {detail?.active_agents ?? 0} traders with prints here
-            {globalAgentTotal != null ? ` · ${globalAgentTotal} agents globally` : ""}
-          </p>
+          <div className="pm-market-meta-row">
+            <span className="pm-market-meta-pill">{detail?.mechanism?.toUpperCase() ?? "—"}</span>
+            <span className="pm-market-meta-pill">P* {pStarPct}</span>
+            <span className="pm-market-meta-pill">{detail?.trade_count ?? 0} trades</span>
+            <span className="pm-market-meta-pill">{detail?.active_agents ?? 0} traders with prints</span>
+            {globalAgentTotal != null ? (
+              <span className="pm-market-meta-pill">{globalAgentTotal} agents globally</span>
+            ) : null}
+          </div>
           {detail ? (
             <button
               type="button"
@@ -709,21 +717,47 @@ export function MarketDetailPage() {
       ) : null}
 
       {detail?.status === "resolved" ? (
-        <section className="pm-panel pm-controls-panel">
+        <section className="pm-panel pm-controls-panel pm-resolved-panel">
           <h2 className="pm-controls-title">Market resolved</h2>
-          <p className="pm-muted small" style={{ marginTop: 0 }}>
-            Outcome: <strong>{(settlement?.outcome ?? detail.resolution ?? "unknown").toUpperCase()}</strong>
-            {detail.resolved_at ? ` · ${new Date(detail.resolved_at).toLocaleString()}` : ""}
-          </p>
-          <p className="pm-muted small">
-            Positions settled: <strong>{settlement?.positions_settled ?? "n/a"}</strong> · Total payout:{" "}
-            <strong>
-              {typeof settlement?.total_payout === "number" ? settlement.total_payout.toFixed(2) : "n/a"}
-            </strong>
-          </p>
+          <div className="pm-resolved-head">
+            <span
+              className={`pm-settle-pill ${
+                (settlement?.outcome ?? detail.resolution ?? "unknown") === "yes"
+                  ? "pm-settle-pill-yes"
+                  : (settlement?.outcome ?? detail.resolution ?? "unknown") === "no"
+                    ? "pm-settle-pill-no"
+                    : ""
+              }`}
+            >
+              Outcome {(settlement?.outcome ?? detail.resolution ?? "unknown").toUpperCase()}
+            </span>
+            <span className="pm-muted small">
+              {detail.resolved_at ? new Date(detail.resolved_at).toLocaleString() : "Resolution time unavailable"}
+            </span>
+          </div>
+          <div className="pm-resolved-stats">
+            <div className="pm-resolved-stat">
+              <span className="pm-resolved-stat-label">Positions settled</span>
+              <strong className="pm-resolved-stat-value">{settlement?.positions_settled ?? "n/a"}</strong>
+            </div>
+            <div className="pm-resolved-stat">
+              <span className="pm-resolved-stat-label">Total payout</span>
+              <strong className="pm-resolved-stat-value">
+                {typeof settlement?.total_payout === "number" ? settlement.total_payout.toFixed(2) : "n/a"}
+              </strong>
+            </div>
+            <div className="pm-resolved-stat">
+              <span className="pm-resolved-stat-label">Payoff / YES share</span>
+              <strong className="pm-resolved-stat-value">
+                {typeof settlement?.payoff_per_yes_share === "number"
+                  ? settlement.payoff_per_yes_share.toFixed(2)
+                  : "n/a"}
+              </strong>
+            </div>
+          </div>
           {settlement ? (
             <div className="pm-two-col">
-              <section className="pm-panel">
+              <section className="pm-panel pm-resolved-subpanel">
                 <h3>Top payouts</h3>
                 <div className="pm-feed">
                   {settlement.winners.length === 0 ? (
@@ -731,14 +765,14 @@ export function MarketDetailPage() {
                   ) : (
                     settlement.winners.slice(0, 5).map((row) => (
                       <div key={`w-${row.agent_id}`} className="pm-feed-row">
-                        Agent {row.agent_id} ({row.name}) · {row.yes_shares.toFixed(2)} shares · payout{" "}
-                        {row.payout.toFixed(2)}
+                        <strong>Agent {row.agent_id}</strong> ({row.name}) · {row.yes_shares.toFixed(2)} shares · payout{" "}
+                        <strong>{row.payout.toFixed(2)}</strong>
                       </div>
                     ))
                   )}
                 </div>
               </section>
-              <section className="pm-panel">
+              <section className="pm-panel pm-resolved-subpanel">
                 <h3>Lowest payouts</h3>
                 <div className="pm-feed">
                   {settlement.losers.length === 0 ? (
@@ -746,8 +780,8 @@ export function MarketDetailPage() {
                   ) : (
                     settlement.losers.slice(0, 5).map((row) => (
                       <div key={`l-${row.agent_id}`} className="pm-feed-row">
-                        Agent {row.agent_id} ({row.name}) · {row.yes_shares.toFixed(2)} shares · payout{" "}
-                        {row.payout.toFixed(2)}
+                        <strong>Agent {row.agent_id}</strong> ({row.name}) · {row.yes_shares.toFixed(2)} shares · payout{" "}
+                        <strong>{row.payout.toFixed(2)}</strong>
                       </div>
                     ))
                   )}
@@ -823,7 +857,7 @@ export function MarketDetailPage() {
         </section>
       )}
 
-      <div className="pm-two-col">
+      <div className={`pm-two-col ${detail?.mechanism === "cda" ? "" : "pm-two-col-single"}`.trim()}>
         <section className="pm-panel pm-grow">
           <h2>Live price</h2>
           <p className="pm-muted small" style={{ marginTop: "-0.25rem", marginBottom: "0.5rem" }}>

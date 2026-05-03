@@ -66,17 +66,26 @@ function fmtDate(v?: string | null) {
   return Number.isNaN(d.getTime()) ? v : d.toLocaleString();
 }
 
-function personalitySummary(personality: Record<string, unknown>) {
+function personalityItems(personality: Record<string, unknown>) {
   const keys = ["participation_rate", "edge_threshold", "signal_sensitivity", "stubbornness", "trade_fraction"];
-  const parts = keys
+  return keys
     .map((key) => {
       const raw = personality[key];
       const n = typeof raw === "number" ? raw : Number(raw);
       if (!Number.isFinite(n)) return null;
-      return `${key.replaceAll("_", " ")} ${(n * 100).toFixed(0)}%`;
+      const label =
+        key === "participation_rate"
+          ? "Participation rate"
+          : key === "edge_threshold"
+            ? "Edge threshold"
+            : key === "signal_sensitivity"
+              ? "Signal sensitivity"
+              : key === "stubbornness"
+                ? "Stubbornness"
+                : "Trade fraction";
+      return { key, label, value: `${(n * 100).toFixed(0)}%` };
     })
-    .filter((x): x is string => x != null);
-  return parts.length > 0 ? parts.join(" · ") : "No personality profile recorded.";
+    .filter((x): x is { key: string; label: string; value: string } => x != null);
 }
 
 export function AgentDetailPage() {
@@ -204,12 +213,28 @@ export function AgentDetailPage() {
       <header className="pm-detail-head">
         <div>
           <h1 className="pm-detail-title">{agent?.name ?? (loading ? "Loading..." : `Agent #${agentId}`)}</h1>
-          <p className="pm-muted">
-            Agent #{agentId} · base belief {fmtPct(agent?.belief)} · rho{" "}
-            {agent?.rho != null ? agent.rho.toFixed(2) : "--"}
-          </p>
+          <div className="pm-agent-identity-row">
+            <span className="pm-agent-identity-pill">Agent #{agentId}</span>
+            <span className="pm-agent-identity-pill">Base belief {fmtPct(agent?.belief)}</span>
+            <span className="pm-agent-identity-pill">
+              Rho {agent?.rho != null ? agent.rho.toFixed(2) : "--"}
+            </span>
+          </div>
           <p className="pm-muted small">Live beliefs are market-specific and shown in each market view.</p>
-          <p className="pm-muted small">{agent ? personalitySummary(agent.personality ?? {}) : "Loading profile..."}</p>
+          {agent ? (
+            <>
+              <div className="pm-agent-metrics-grid" aria-label="Personality profile">
+                {personalityItems(agent.personality ?? {}).map((item) => (
+                  <div key={item.key} className="pm-agent-metric-chip">
+                    <span className="pm-agent-metric-label">{item.label}</span>
+                    <strong className="pm-agent-metric-value">{item.value}</strong>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="pm-muted small">Loading profile...</p>
+          )}
           {agent ? (
             <button
               type="button"
@@ -240,26 +265,32 @@ export function AgentDetailPage() {
               <tr>
                 <th>Market</th>
                 <th>Status</th>
-                <th>Position</th>
-                <th>Mark price</th>
-                <th>Unrealized PnL</th>
-                <th>Trades</th>
+                  <th className="pm-col-center">Position</th>
+                  <th className="pm-col-center">Mark price</th>
+                  <th className="pm-col-center">Unrealized PnL</th>
+                  <th className="pm-col-center">Trades</th>
               </tr>
             </thead>
             <tbody>
               {markets.map((m) => (
                 <tr key={m.market_id}>
                   <td>
-                    <Link to={`/market/${m.market_id}`}>{m.title || `Market #${m.market_id}`}</Link>
+                    <button
+                      type="button"
+                      className="pm-inline-link-btn"
+                      onClick={() => navigate(`/market/${m.market_id}`)}
+                    >
+                      {m.title || `Market #${m.market_id}`}
+                    </button>
                     <div className="pm-comment-meta">{m.mechanism.toUpperCase()}</div>
                   </td>
                   <td>{m.status}</td>
-                  <td>{m.position.toFixed(2)}</td>
-                  <td>{fmtPct(m.price)}</td>
-                  <td className={m.unrealized_pnl >= 0 ? "profit-pos" : "profit-neg"}>
+                    <td className="pm-col-center">{m.position.toFixed(2)}</td>
+                    <td className="pm-col-center">{fmtPct(m.price)}</td>
+                    <td className={`pm-col-center ${m.unrealized_pnl >= 0 ? "profit-pos" : "profit-neg"}`}>
                     {fmtSignedMoney(m.unrealized_pnl)}
                   </td>
-                  <td>{m.trade_count}</td>
+                    <td className="pm-col-center">{m.trade_count}</td>
                 </tr>
               ))}
             </tbody>
@@ -304,7 +335,13 @@ export function AgentDetailPage() {
                   <tr key={t.trade_id}>
                     <td>{fmtDate(t.at)}</td>
                     <td>
-                      <Link to={`/market/${t.market_id}`}>{t.market_title || `Market #${t.market_id}`}</Link>
+                      <button
+                        type="button"
+                        className="pm-inline-link-btn"
+                        onClick={() => navigate(`/market/${t.market_id}`)}
+                      >
+                        {t.market_title || `Market #${t.market_id}`}
+                      </button>
                     </td>
                     <td>{t.side ?? (t.quantity >= 0 ? "buy_yes" : "sell_yes")}</td>
                     <td>{t.quantity.toFixed(2)}</td>
@@ -325,7 +362,13 @@ export function AgentDetailPage() {
               comments.map((c) => (
                 <div key={`${c.market_id}-${c.id}`} className="pm-comment">
                   <div className="pm-comment-meta">
-                    <Link to={`/market/${c.market_id}`}>{c.market_title || `Market #${c.market_id}`}</Link>
+                    <button
+                      type="button"
+                      className="pm-inline-link-btn"
+                      onClick={() => navigate(`/market/${c.market_id}`)}
+                    >
+                      {c.market_title || `Market #${c.market_id}`}
+                    </button>
                     {" · "}
                     {c.source === "llm" ? "LLM" : "template"} · {fmtDate(c.at)}
                   </div>

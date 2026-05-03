@@ -8,9 +8,37 @@ type AgentRow = {
   belief: number | null;
   avg_joined_belief?: number | null;
   rho: number | null;
+  personality?: Record<string, unknown>;
 };
 
 type SortKey = "agent_id" | "name" | "avg_joined_belief" | "cash" | "rho";
+
+function fmtPct(v: number | null | undefined) {
+  return typeof v === "number" && Number.isFinite(v) ? `${(v * 100).toFixed(1)}%` : "—";
+}
+
+function personalityItems(personality?: Record<string, unknown>) {
+  if (!personality) return [];
+  const keys = ["participation_rate", "edge_threshold", "signal_sensitivity", "stubbornness", "trade_fraction"];
+  return keys
+    .map((key) => {
+      const raw = personality[key];
+      const n = typeof raw === "number" ? raw : Number(raw);
+      if (!Number.isFinite(n)) return null;
+      const label =
+        key === "participation_rate"
+          ? "Participation"
+          : key === "edge_threshold"
+            ? "Edge threshold"
+            : key === "signal_sensitivity"
+              ? "Signal sensitivity"
+              : key === "stubbornness"
+                ? "Stubbornness"
+                : "Trade fraction";
+      return { key, label, value: `${(n * 100).toFixed(0)}%` };
+    })
+    .filter((x): x is { key: string; label: string; value: string } => x != null);
+}
 
 export function AgentsPage() {
   const navigate = useNavigate();
@@ -145,7 +173,7 @@ export function AgentsPage() {
                   Name {sortKey === "name" ? (sortDir === "asc" ? "↑" : "↓") : ""}
                 </button>
               </th>
-              <th>
+              <th className="pm-col-center">
                 <button type="button" className="pm-th-btn" onClick={() => toggleSort("avg_joined_belief")}>
                   Avg joined belief {sortKey === "avg_joined_belief" ? (sortDir === "asc" ? "↑" : "↓") : ""}
                 </button>
@@ -172,11 +200,33 @@ export function AgentsPage() {
               >
                 <td>{a.agent_id}</td>
                 <td>
-                  <Link to={`/agents/${a.agent_id}`} onClick={(e) => e.stopPropagation()}>
-                    {a.name}
+                  <Link
+                    to={`/agents/${a.agent_id}`}
+                    className="pm-agent-link"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <span className="pm-agent-link-title">{a.name}</span>
+                    <span className="pm-agent-link-meta">
+                      Agent #{a.agent_id} · base belief {fmtPct(a.belief)} · rho {a.rho != null ? a.rho.toFixed(2) : "—"}
+                    </span>
+                    <span className="pm-agent-link-submeta">
+                      {(() => {
+                        const items = personalityItems(a.personality);
+                        if (items.length === 0) return "No personality profile";
+                        return (
+                          <span className="pm-agent-metrics-inline">
+                            {items.map((item) => (
+                              <span key={`${a.agent_id}-${item.key}`} className="pm-agent-metric-pill">
+                                {item.label} {item.value}
+                              </span>
+                            ))}
+                          </span>
+                        );
+                      })()}
+                    </span>
                   </Link>
                 </td>
-                <td>{a.avg_joined_belief != null ? `${(a.avg_joined_belief * 100).toFixed(1)}%` : "—"}</td>
+                <td className="pm-col-center">{fmtPct(a.avg_joined_belief)}</td>
                 <td>{a.rho != null ? a.rho.toFixed(2) : "—"}</td>
                 <td>${a.cash?.toFixed(2) ?? "—"}</td>
                 <td onClick={(e) => e.stopPropagation()}>
