@@ -847,6 +847,7 @@ export function MarketDetailPage() {
                   />
                   <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11 }} stroke="#64748b" />
                   <Tooltip
+                    labelFormatter={(label: number | string) => `${Number(label).toFixed(1)}s`}
                     formatter={(v: number | string, name: string) => [
                       typeof v === "number" ? `${v}%` : String(v),
                       name,
